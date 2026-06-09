@@ -40,8 +40,18 @@ runs:
           --scripts "systemctl is-active ${UNITS} 2>&1 | tr '\n' ' '; echo" \
           --query 'value[0].message' -o tsv)
         echo "${VM}: ${MSG}"
-        # Any unit not "active" → fail. is-active emits per-line states.
-        if echo "$MSG" | grep -vE '^(active +)+ *$' >/dev/null; then
-          echo "::error::One or more units on ${VM} are not active (units: ${UNITS}). Output: ${MSG}"
+        # az run-command's `message` field includes its own "Enable succeeded:"
+        # preamble + stdout/stderr block markers around the actual script
+        # output. Don't require EVERY line to match — instead, ensure each
+        # requested unit appears at least once as "active" AND no failure
+        # markers anywhere in the message.
+        EXPECTED=$(echo "${UNITS}" | wc -w)
+        ACTIVE=$(echo "$MSG" | grep -oE '(^|[[:space:]])active([[:space:]]|$)' | wc -l)
+        if echo "$MSG" | grep -qE '\b(inactive|failed|activating|deactivating|unknown)\b'; then
+          echo "::error::Unit on ${VM} reports non-active state. Output: ${MSG}"
+          exit 1
+        fi
+        if [[ "$ACTIVE" -lt "$EXPECTED" ]]; then
+          echo "::error::Expected ${EXPECTED} active units on ${VM}, found ${ACTIVE}. Output: ${MSG}"
           exit 1
         fi

@@ -141,8 +141,21 @@ jobs:
                 --scripts "systemctl is-active ${UNITS} 2>&1 | tr '\n' ' '; echo" \
                 --query 'value[0].message' -o tsv)
               echo "${VM}: ${SMOKE_MSG}"
-              if echo "$SMOKE_MSG" | grep -vE '^(active +)+ *$' >/dev/null; then
-                echo "::error::Unit on ${VM} not active. Output: ${SMOKE_MSG}"
+              # az run-command returns a `message` field that includes its own
+              # "Enable succeeded:" preamble + stdout/stderr block markers
+              # alongside the actual script output. Don't require EVERY line
+              # to match — instead, ensure each requested unit appears at
+              # least once as "active" in the message.
+              EXPECTED_UNIT_COUNT=$(echo "${UNITS}" | wc -w)
+              ACTIVE_COUNT=$(echo "$SMOKE_MSG" | grep -oE '(^|[[:space:]])active([[:space:]]|$)' | wc -l)
+              # Also fail if we see any failure-state markers anywhere in the
+              # message (more specific than "missing active").
+              if echo "$SMOKE_MSG" | grep -qE '\b(inactive|failed|activating|deactivating|unknown)\b'; then
+                echo "::error::Unit on ${VM} reports non-active state. Output: ${SMOKE_MSG}"
+                exit 1
+              fi
+              if [[ "$ACTIVE_COUNT" -lt "$EXPECTED_UNIT_COUNT" ]]; then
+                echo "::error::Expected ${EXPECTED_UNIT_COUNT} active units on ${VM}, found ${ACTIVE_COUNT}. Output: ${SMOKE_MSG}"
                 exit 1
               fi
             fi
