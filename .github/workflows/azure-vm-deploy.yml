@@ -110,6 +110,35 @@ jobs:
           RG: ${{ inputs.resource-group }}
         run: |
           set -euo pipefail
+          # az vm run-command is serialised per-VM by Azure — invocations
+          # collide with a (Conflict) error when a prior extension run is
+          # still in flight (operator ad-hoc commands, prior deploy that
+          # didn't finish cleaning up, etc.). Retry with backoff so the
+          # workflow doesn't fail on transient collisions.
+          run_with_retry() {
+            local description="$1"; shift
+            local attempt=1
+            local max_attempts=5
+            local wait_seconds=10
+            while [[ $attempt -le $max_attempts ]]; do
+              if OUT=$("$@" 2>&1); then
+                echo "$OUT"
+                return 0
+              fi
+              if echo "$OUT" | grep -q "(Conflict)"; then
+                echo "::warning::${description}: attempt ${attempt}/${max_attempts} hit (Conflict); retrying in ${wait_seconds}s"
+                sleep "$wait_seconds"
+                wait_seconds=$((wait_seconds * 2))
+                attempt=$((attempt + 1))
+                continue
+              fi
+              # Non-Conflict error — surface immediately, don't retry blindly.
+              echo "$OUT"
+              return 1
+            done
+            echo "::error::${description}: exhausted ${max_attempts} retries on (Conflict)"
+            return 1
+          }
           # Iterate targets, calling the per-VM script + smoke check inline.
           # We do this inline (not as a matrix) because az run-command is
           # serial-friendly + matrix would each pay the checkout cost.
@@ -119,7 +148,7 @@ jobs:
             SCRIPT=$(echo "$TARGETS_YAML" | yq ".[${i}].apply-script" -)
             UNITS=$(echo "$TARGETS_YAML" | yq ".[${i}].smoke-units" -)
             echo "=== Deploying ${VM} ==="
-            MSG=$(az vm run-command invoke \
+            MSG=$(run_with_retry "apply on ${VM}" az vm run-command invoke \
               --resource-group "$RG" \
               --name "$VM" \
               --command-id RunShellScript \
@@ -134,7 +163,7 @@ jobs:
             fi
             if [[ -n "${UNITS}" && "${UNITS}" != "null" ]]; then
               echo "=== Smoke ${VM} (${UNITS}) ==="
-              SMOKE_MSG=$(az vm run-command invoke \
+              SMOKE_MSG=$(run_with_retry "smoke on ${VM}" az vm run-command invoke \
                 --resource-group "$RG" \
                 --name "$VM" \
                 --command-id RunShellScript \
