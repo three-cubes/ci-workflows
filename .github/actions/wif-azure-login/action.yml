@@ -10,12 +10,14 @@ description: |
     - Federated credential bound to repo + ref + (optional) environment
     - Repo variables AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
 
-  Usage:
+  Usage (replace {{ ... }} with the literal GitHub-Actions expression
+  syntax — it's been de-templated here so the action.yml parser doesn't try
+  to evaluate the docstring):
     - uses: three-cubes/platform-templates/.github/actions/wif-azure-login@v1
       with:
-        client-id: ${{ vars.AZURE_CLIENT_ID }}
-        tenant-id: ${{ vars.AZURE_TENANT_ID }}
-        subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        client-id:       {{ vars.AZURE_CLIENT_ID }}
+        tenant-id:       {{ vars.AZURE_TENANT_ID }}
+        subscription-id: {{ vars.AZURE_SUBSCRIPTION_ID }}
 
 inputs:
   client-id:

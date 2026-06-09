@@ -20,7 +20,10 @@ description: |
         resource-group: RG-AGENTS-CORE
         vm-names: 'vm-openclaw,vm-hermes-poc'
         op-tag: deploy-on-merge
-        skip: ${{ github.event.inputs.skip_snapshot }}
+        skip:           {{ github.event.inputs.skip_snapshot }}
+  (replace {{ ... }} with the literal $-prefixed GitHub-Actions expression
+  syntax — de-templated in this docstring so the action parser doesn't
+  try to evaluate the example.)
 
 inputs:
   resource-group:

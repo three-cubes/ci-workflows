@@ -21,9 +21,9 @@ description: |
           bash devsecops/apply/apply-openclaw-config.sh --no-snapshot
 
   The script payload is treated as a fixed string — DO NOT interpolate
-  untrusted ${{ github... }} values into it. Use other inputs of THIS action
-  if you need parameterisation, then reference them as $VARS inside the
-  script body.
+  untrusted GitHub-Actions expression values into it. Use other inputs of
+  THIS action if you need parameterisation, then reference them as $VARS
+  inside the script body.
 
 inputs:
   resource-group:
