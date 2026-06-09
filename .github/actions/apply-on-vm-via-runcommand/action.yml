@@ -1,0 +1,91 @@
+name: 'Apply on Azure VM via Run-Command'
+description: |
+  Invokes a bash script on a target Azure VM via `az vm run-command invoke`.
+  The script runs as root on the VM. Pairs with snapshot-azure-vm-disk for
+  the safe-by-default rollback path.
+
+  Inputs are env-var'd before reaching the run shell (per GitHub Actions
+  injection-hardening guidance — workflow_dispatch choice constraints alone
+  aren't enough).
+
+  Typical usage:
+    - uses: three-cubes/platform-templates/.github/actions/apply-on-vm-via-runcommand@v1
+      with:
+        resource-group: RG-AGENTS-CORE
+        vm-name: vm-openclaw
+        script: |
+          set -e
+          export HOME=/root
+          cd /data/development/tc-agent-zone
+          git pull --ff-only
+          bash devsecops/apply/apply-openclaw-config.sh --no-snapshot
+
+  The script payload is treated as a fixed string — DO NOT interpolate
+  untrusted ${{ github... }} values into it. Use other inputs of THIS action
+  if you need parameterisation, then reference them as $VARS inside the
+  script body.
+
+inputs:
+  resource-group:
+    description: Azure resource group containing the VM.
+    required: true
+  vm-name:
+    description: Target VM name.
+    required: true
+  script:
+    description: Bash script body to execute as root on the VM.
+    required: true
+  fail-on-script-error:
+    description: |
+      If "true" (default), the action fails when az vm run-command itself
+      fails OR when the script's exit code is non-zero. Set to "false" only
+      when the script's failure is expected/handled by the caller.
+    required: false
+    default: 'true'
+
+outputs:
+  message:
+    description: The 'message' field returned by az vm run-command (script output).
+    value: ${{ steps.run.outputs.message }}
+
+runs:
+  using: composite
+  steps:
+    - name: Invoke run-command
+      id: run
+      shell: bash
+      env:
+        RG: ${{ inputs.resource-group }}
+        VM: ${{ inputs.vm-name }}
+        SCRIPT_BODY: ${{ inputs.script }}
+        FAIL_ON_ERR: ${{ inputs.fail-on-script-error }}
+      run: |
+        set -euo pipefail
+        MSG=$(az vm run-command invoke \
+          --resource-group "$RG" \
+          --name "$VM" \
+          --command-id RunShellScript \
+          --scripts "$SCRIPT_BODY" \
+          --query 'value[0].message' -o tsv) || RC=$?
+        RC=${RC:-0}
+        echo "----- BEGIN run-command output ($VM) -----"
+        echo "$MSG"
+        echo "----- END run-command output ($VM) -----"
+        # az vm run-command exits 0 even when the *script* failed — sniff
+        # the message for the typical bash error markers so we don't silently
+        # mark a broken deploy as green.
+        if [[ "$FAIL_ON_ERR" == "true" ]]; then
+          if echo "$MSG" | grep -qE '(^FAIL |^✗ |^ERROR:|Permission denied|fatal: |command not found)'; then
+            echo "::error::Apply script on ${VM} reported failure in output (see above)."
+            exit 1
+          fi
+        fi
+        if [[ "$RC" -ne 0 ]]; then
+          echo "::error::az vm run-command exited with code ${RC} for ${VM}"
+          exit "$RC"
+        fi
+        {
+          echo "message<<EOF"
+          echo "$MSG"
+          echo "EOF"
+        } >>"$GITHUB_OUTPUT"

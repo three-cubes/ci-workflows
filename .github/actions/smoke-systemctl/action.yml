@@ -1,0 +1,47 @@
+name: 'Smoke check systemctl units on Azure VM'
+description: |
+  Post-deploy sanity check — runs `systemctl is-active` against a list of
+  units on the target VM via `az vm run-command invoke`. Fails if any unit
+  is not `active`.
+
+  Usage:
+    - uses: three-cubes/platform-templates/.github/actions/smoke-systemctl@v1
+      with:
+        resource-group: RG-AGENTS-CORE
+        vm-name: vm-openclaw
+        units: 'openclaw-gateway cli-proxy-api otel-collector caddy'
+
+inputs:
+  resource-group:
+    description: Azure resource group containing the VM.
+    required: true
+  vm-name:
+    description: Target VM name.
+    required: true
+  units:
+    description: Space-separated list of systemd unit names to check.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: systemctl is-active rollup
+      shell: bash
+      env:
+        RG: ${{ inputs.resource-group }}
+        VM: ${{ inputs.vm-name }}
+        UNITS: ${{ inputs.units }}
+      run: |
+        set -euo pipefail
+        MSG=$(az vm run-command invoke \
+          --resource-group "$RG" \
+          --name "$VM" \
+          --command-id RunShellScript \
+          --scripts "systemctl is-active ${UNITS} 2>&1 | tr '\n' ' '; echo" \
+          --query 'value[0].message' -o tsv)
+        echo "${VM}: ${MSG}"
+        # Any unit not "active" → fail. is-active emits per-line states.
+        if echo "$MSG" | grep -vE '^(active +)+ *$' >/dev/null; then
+          echo "::error::One or more units on ${VM} are not active (units: ${UNITS}). Output: ${MSG}"
+          exit 1
+        fi

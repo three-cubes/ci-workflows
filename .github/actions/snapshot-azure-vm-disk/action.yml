@@ -1,0 +1,94 @@
+name: 'Snapshot Azure VM OS-Disk'
+description: |
+  Takes an OS-disk snapshot of one or more Azure VMs before a destructive op.
+  Use this as the first step in any reusable deploy workflow — the snapshot
+  is the rollback window. Skips cleanly with a loud warn if SKIP_SNAPSHOT is
+  set (dev-only override).
+
+  Requires a prior wif-azure-login step (the runner identity needs
+  `Disk Snapshot Contributor` scoped to the VM's resource group).
+
+  Snapshot naming follows the Three Cubes convention:
+    <vm-name>-osdisk-pre-<op-tag>-YYYYMMDD-HHMMSS
+
+  Snapshots are NOT auto-deleted by this action. Pair with a prune cron in
+  the consuming repo (see docs/COST-OPTIMIZATION.md §Snapshot retention).
+
+  Usage:
+    - uses: three-cubes/platform-templates/.github/actions/snapshot-azure-vm-disk@v1
+      with:
+        resource-group: RG-AGENTS-CORE
+        vm-names: 'vm-openclaw,vm-hermes-poc'
+        op-tag: deploy-on-merge
+        skip: ${{ github.event.inputs.skip_snapshot }}
+
+inputs:
+  resource-group:
+    description: Azure resource group containing the VM(s).
+    required: true
+  vm-names:
+    description: Comma-separated list of VM names to snapshot.
+    required: true
+  op-tag:
+    description: Short tag identifying the operation (e.g. apply-config, deploy-on-merge). Becomes part of the snapshot name.
+    required: true
+  skip:
+    description: |
+      Set to "true" to skip snapshot — dev-only override. Logs a warn; never silently skips.
+      Useful for the first WIF smoke test before role assignments propagate.
+    required: false
+    default: 'false'
+
+outputs:
+  snapshot-names:
+    description: Newline-separated list of snapshot resource names created.
+    value: ${{ steps.snap.outputs.snapshot-names }}
+
+runs:
+  using: composite
+  steps:
+    - name: Take snapshots
+      id: snap
+      shell: bash
+      env:
+        RG: ${{ inputs.resource-group }}
+        VMS: ${{ inputs.vm-names }}
+        OP: ${{ inputs.op-tag }}
+        SKIP: ${{ inputs.skip }}
+      run: |
+        set -euo pipefail
+        if [[ "${SKIP}" == "true" ]]; then
+          echo "::warning::SKIP_SNAPSHOT=true — refusing to snapshot. Dev override only; production deploys MUST snapshot."
+          echo "snapshot-names=" >>"$GITHUB_OUTPUT"
+          exit 0
+        fi
+        STAMP=$(date -u +%Y%m%d-%H%M%S)
+        NAMES=""
+        IFS=',' read -ra VM_LIST <<< "${VMS}"
+        for vm in "${VM_LIST[@]}"; do
+          vm=$(echo "$vm" | xargs)   # trim whitespace
+          [[ -z "$vm" ]] && continue
+          OSDISK_ID=$(az vm show -g "$RG" -n "$vm" \
+            --query 'storageProfile.osDisk.managedDisk.id' -o tsv)
+          if [[ -z "$OSDISK_ID" ]]; then
+            echo "::error::Could not resolve OS disk for ${vm} in ${RG}. Check VM exists + identity has Reader on RG."
+            exit 1
+          fi
+          NAME="${vm}-osdisk-pre-${OP}-${STAMP}"
+          echo "Creating snapshot: ${NAME}"
+          STATE=$(az snapshot create \
+            -g "$RG" \
+            -n "$NAME" \
+            --source "$OSDISK_ID" \
+            --query 'provisioningState' -o tsv)
+          if [[ "$STATE" != "Succeeded" ]]; then
+            echo "::error::Snapshot ${NAME} did not reach Succeeded (state: ${STATE})"
+            exit 1
+          fi
+          NAMES="${NAMES}${NAME}"$'\n'
+        done
+        {
+          echo "snapshot-names<<EOF"
+          echo "${NAMES}"
+          echo "EOF"
+        } >>"$GITHUB_OUTPUT"

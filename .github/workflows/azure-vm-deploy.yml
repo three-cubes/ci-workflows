@@ -1,0 +1,149 @@
+name: 'Reusable — Azure VM deploy (WIF → snapshot → apply → smoke)'
+
+# Three Cubes shared deploy workflow.
+#
+# Consumers call this from their own workflow with:
+#
+#   jobs:
+#     deploy:
+#       uses: three-cubes/platform-templates/.github/workflows/azure-vm-deploy.yml@v1
+#       with:
+#         resource-group: RG-AGENTS-CORE
+#         targets: |
+#           - vm-name: vm-openclaw
+#             apply-script: |
+#               cd /data/development/tc-agent-zone && git pull --ff-only
+#               bash devsecops/apply/apply-openclaw-config.sh --no-snapshot
+#             smoke-units: 'openclaw-gateway cli-proxy-api caddy'
+#           - vm-name: vm-hermes-poc
+#             apply-script: |
+#               cd /data/development/tc-agent-zone && git pull --ff-only
+#               bash devsecops/apply/hermes/apply-config.sh --no-snapshot
+#             smoke-units: 'hermes-gateway-northcoast-retention.service'
+#         op-tag: deploy-on-merge
+#         skip-snapshot: ${{ inputs.skip_snapshot }}
+#       permissions:
+#         contents: read
+#         id-token: write
+#       secrets: inherit  # so the caller's AZURE_* repo vars are visible
+#
+# The `targets` input is a YAML string. Parsed at runtime by yq inside the
+# job. Each target gets snapshot → apply → smoke in sequence.
+
+on:
+  workflow_call:
+    inputs:
+      resource-group:
+        description: Azure resource group containing all target VMs.
+        required: true
+        type: string
+      targets:
+        description: |
+          YAML string. List of {vm-name, apply-script, smoke-units} maps.
+          See header comment for the canonical shape.
+        required: true
+        type: string
+      op-tag:
+        description: Short tag for the snapshot name (e.g. apply-config, deploy-on-merge).
+        required: true
+        type: string
+      skip-snapshot:
+        description: |
+          Set to "true" to skip snapshot-before-apply. Dev override only.
+        required: false
+        type: string
+        default: 'false'
+      azure-client-id:
+        description: WIF identity client ID (typically vars.AZURE_CLIENT_ID).
+        required: true
+        type: string
+      azure-tenant-id:
+        description: Azure AD tenant ID (typically vars.AZURE_TENANT_ID).
+        required: true
+        type: string
+      azure-subscription-id:
+        description: Subscription ID (typically vars.AZURE_SUBSCRIPTION_ID).
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: WIF → snapshot → apply → smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: WIF Azure login
+        uses: three-cubes/platform-templates/.github/actions/wif-azure-login@v1
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.azure-subscription-id }}
+
+      - name: Parse targets
+        id: parse
+        shell: bash
+        env:
+          TARGETS_YAML: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          # Extract just the VM names for the snapshot step (comma-separated).
+          VM_LIST=$(echo "$TARGETS_YAML" | yq '[.[].vm-name] | join(",")' -)
+          echo "vm-list=${VM_LIST}" >>"$GITHUB_OUTPUT"
+
+      - name: Snapshot all VMs
+        uses: three-cubes/platform-templates/.github/actions/snapshot-azure-vm-disk@v1
+        with:
+          resource-group: ${{ inputs.resource-group }}
+          vm-names: ${{ steps.parse.outputs.vm-list }}
+          op-tag: ${{ inputs.op-tag }}
+          skip: ${{ inputs.skip-snapshot }}
+
+      - name: Apply on each target + smoke
+        shell: bash
+        env:
+          TARGETS_YAML: ${{ inputs.targets }}
+          RG: ${{ inputs.resource-group }}
+        run: |
+          set -euo pipefail
+          # Iterate targets, calling the per-VM script + smoke check inline.
+          # We do this inline (not as a matrix) because az run-command is
+          # serial-friendly + matrix would each pay the checkout cost.
+          COUNT=$(echo "$TARGETS_YAML" | yq 'length' -)
+          for i in $(seq 0 $((COUNT - 1))); do
+            VM=$(echo "$TARGETS_YAML" | yq ".[${i}].vm-name" -)
+            SCRIPT=$(echo "$TARGETS_YAML" | yq ".[${i}].apply-script" -)
+            UNITS=$(echo "$TARGETS_YAML" | yq ".[${i}].smoke-units" -)
+            echo "=== Deploying ${VM} ==="
+            MSG=$(az vm run-command invoke \
+              --resource-group "$RG" \
+              --name "$VM" \
+              --command-id RunShellScript \
+              --scripts "set -e; export HOME=/root; ${SCRIPT}" \
+              --query 'value[0].message' -o tsv)
+            echo "----- BEGIN ${VM} apply output -----"
+            echo "$MSG"
+            echo "----- END ${VM} apply output -----"
+            if echo "$MSG" | grep -qE '(^FAIL |^✗ |^ERROR:|Permission denied|fatal: |command not found)'; then
+              echo "::error::Apply on ${VM} reported failure (see output above)."
+              exit 1
+            fi
+            if [[ -n "${UNITS}" && "${UNITS}" != "null" ]]; then
+              echo "=== Smoke ${VM} (${UNITS}) ==="
+              SMOKE_MSG=$(az vm run-command invoke \
+                --resource-group "$RG" \
+                --name "$VM" \
+                --command-id RunShellScript \
+                --scripts "systemctl is-active ${UNITS} 2>&1 | tr '\n' ' '; echo" \
+                --query 'value[0].message' -o tsv)
+              echo "${VM}: ${SMOKE_MSG}"
+              if echo "$SMOKE_MSG" | grep -vE '^(active +)+ *$' >/dev/null; then
+                echo "::error::Unit on ${VM} not active. Output: ${SMOKE_MSG}"
+                exit 1
+              fi
+            fi
+          done
