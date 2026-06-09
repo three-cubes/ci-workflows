@@ -46,7 +46,10 @@ runs:
         # requested unit appears at least once as "active" AND no failure
         # markers anywhere in the message.
         EXPECTED=$(echo "${UNITS}" | wc -w)
-        ACTIVE=$(echo "$MSG" | grep -oE '(^|[[:space:]])active([[:space:]]|$)' | wc -l)
+        # Split into one-word-per-line then count exact matches — grep -oE
+        # with a delimiter-aware pattern undercounts because consecutive
+        # matches share the space (e.g. "active active active" → 2 matches).
+        ACTIVE=$(echo "$MSG" | tr -s '[:space:]' '\n' | grep -cx 'active')
         if echo "$MSG" | grep -qE '\b(inactive|failed|activating|deactivating|unknown)\b'; then
           echo "::error::Unit on ${VM} reports non-active state. Output: ${MSG}"
           exit 1

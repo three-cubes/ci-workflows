@@ -175,8 +175,13 @@ jobs:
               # alongside the actual script output. Don't require EVERY line
               # to match — instead, ensure each requested unit appears at
               # least once as "active" in the message.
+              #
+              # Counting note: split the message into one-word-per-line and
+              # count exact matches. Using grep -oE with a delimiter-aware
+              # pattern undercounts because consecutive matches share the
+              # space character (e.g. "active active active" → 2 matches).
               EXPECTED_UNIT_COUNT=$(echo "${UNITS}" | wc -w)
-              ACTIVE_COUNT=$(echo "$SMOKE_MSG" | grep -oE '(^|[[:space:]])active([[:space:]]|$)' | wc -l)
+              ACTIVE_COUNT=$(echo "$SMOKE_MSG" | tr -s '[:space:]' '\n' | grep -cx 'active')
               # Also fail if we see any failure-state markers anywhere in the
               # message (more specific than "missing active").
               if echo "$SMOKE_MSG" | grep -qE '\b(inactive|failed|activating|deactivating|unknown)\b'; then
