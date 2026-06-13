@@ -1,0 +1,35 @@
+name: setup-uv-cached
+description: Pinned uv with a cached venv for three-cubes Python repos. The org-standard install seam.
+inputs:
+  uv-version:
+    description: uv version to pin (keep in step with the org standard).
+    default: "0.11.16"
+  python-version:
+    description: Python version uv resolves against.
+    default: "3.12"
+  sync-args:
+    description: >-
+      Arguments to `uv sync`. Workspace repos use `--locked --all-packages`;
+      single-package repos use e.g. `--all-extras --all-groups`. Per-repo input.
+    default: "--locked --all-packages"
+  ci-requirements:
+    description: >-
+      Optional `--require-hashes` requirements file for CI-only tools to install
+      into the same .venv (empty string skips this step).
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Install pinned uv (cached)
+      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      with:
+        version: ${{ inputs.uv-version }}
+        python-version: ${{ inputs.python-version }}
+        enable-cache: true
+    - name: uv sync
+      shell: bash
+      run: uv sync ${{ inputs.sync-args }}
+    - name: Install CI tools (require-hashes)
+      if: inputs.ci-requirements != ''
+      shell: bash
+      run: uv pip install --require-hashes --only-binary :all: -r "${{ inputs.ci-requirements }}"
