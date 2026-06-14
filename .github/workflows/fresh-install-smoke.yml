@@ -1,0 +1,117 @@
+name: fresh-install-smoke
+
+# Reusable (workflow_call) fresh-install smoke gate for three-cubes repos.
+# Generalizes kairix's F81 smoke: build the candidate image locally, tag it
+# under the production image name the compose stack interpolates, then hand
+# off to the repo's own smoke script which replays the README docker-compose
+# quick start from a clean dir and asserts the install actually boots
+# (healthz/ready → MCP handshake → setup wizard → BM25 search).
+#
+# The build half (setup-buildx + build-push-action with gha layer cache) is
+# generic; the assertion half lives entirely in the caller's `smoke-script`,
+# so per-repo install semantics stay in the caller, not this workflow.
+#
+# Image wiring: the build loads a local image tagged `<image-name>:<image-tag>`
+# (never pushed). The caller's docker-compose interpolates that tag via an
+# env var (kairix: KAIRIX_IMAGE_TAG); `smoke-env-var-name` names it and is set
+# to `image-tag` for the smoke step so compose resolves the just-built local
+# image.
+#
+# NON-required workflow by convention: callers wire this as a non-blocking,
+# nightly / on-demand / fresh-install-path-PR check, not a branch-protection
+# gate. The caller's thin workflow owns the `on:` triggers.
+#
+# Part of three-cubes/kairix#499 Phase 4 (org CI consolidation).
+
+on:
+  workflow_call:
+    inputs:
+      # ── Image identity ──────────────────────────────────────────────────
+      image-name:
+        description: >-
+          Full image reference WITHOUT the tag (e.g.
+          ghcr.io/three-cubes/kairix). The build tags this as
+          `<image-name>:<image-tag>` and loads it locally so the caller's
+          docker-compose resolves the just-built image instead of pulling.
+        type: string
+        required: true
+      image-tag:
+        description: >-
+          Local tag for the candidate image. Also the value passed to the
+          smoke env var so compose interpolates this tag (load-only, never
+          pushed).
+        type: string
+        default: "fresh-smoke"
+      # ── Build surface ───────────────────────────────────────────────────
+      build-context:
+        description: "Docker build context passed to build-push-action."
+        type: string
+        default: "."
+      dockerfile:
+        description: "Path to the Dockerfile relative to the build context."
+        type: string
+        default: "Dockerfile"
+      # ── Smoke surface ───────────────────────────────────────────────────
+      smoke-script:
+        description: "Path to the repo's fresh-install smoke script (run with bash)."
+        type: string
+        default: "scripts/checks/check-fresh-install-smoke.sh"
+      smoke-env-var-name:
+        description: >-
+          Name of the env var the smoke script (and the caller's compose
+          file) reads for the image tag. kairix reads KAIRIX_IMAGE_TAG.
+        type: string
+        default: "KAIRIX_IMAGE_TAG"
+      # ── Runner ──────────────────────────────────────────────────────────
+      timeout-minutes:
+        description: "Job timeout. The smoke script has its own bounded waits inside this ceiling."
+        type: number
+        default: 45
+
+permissions:
+  contents: read
+
+jobs:
+  fresh-install-smoke:
+    name: Fresh install smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    # Node 24 shim for JS actions on older runner images; harmless when the
+    # runner already defaults to node24.
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      # Build + gha-cache pattern shared with the repo's ci.yml Docker job so
+      # both workflows reuse layer cache. Tagged under the production image
+      # name because the caller's docker-compose interpolates
+      # `<image-name>:<smoke-env-var>`; the tag is local only (load, never push).
+      - name: Build candidate image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: ${{ inputs.build-context }}
+          file: ${{ inputs.build-context }}/${{ inputs.dockerfile }}
+          load: true
+          tags: ${{ inputs.image-name }}:${{ inputs.image-tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run fresh-install smoke
+        shell: bash
+        env:
+          SMOKE_ENV_VAR_NAME: ${{ inputs.smoke-env-var-name }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          SMOKE_SCRIPT: ${{ inputs.smoke-script }}
+        run: |
+          set -euo pipefail
+          # Export the caller-named image-tag env var (e.g. KAIRIX_IMAGE_TAG)
+          # so the smoke script and compose resolve the local candidate image.
+          export "${SMOKE_ENV_VAR_NAME}=${IMAGE_TAG}"
+          bash "$SMOKE_SCRIPT"

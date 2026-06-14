@@ -1,0 +1,127 @@
+name: sonar-scan
+
+# Reusable (workflow_call) SonarCloud scan for three-cubes repos — the
+# ARTIFACT-HANDOFF shape mandated by three-cubes/kairix#499 Phase 4.
+#
+# This job does NOT run the test suite. It DOWNLOADS the coverage XML and
+# JUnit test-results artifacts that an upstream quality-gate job already
+# produced, then runs the Sonar scanner against the working tree + those
+# imported reports. Re-running pytest here purely to regenerate coverage is
+# the #499 anti-pattern this workflow exists to remove: it doubles CI minutes
+# and lets the scan silently disagree with the gate's own coverage.
+#
+# Coverage + test-results paths are read by Sonar from the repo's
+# `sonar-project.properties` (sonar.python.coverage.reportPaths,
+# sonar.python.xunit.reportPath); this workflow only lands the artifacts on
+# disk where those property paths expect them. Both downloads are
+# continue-on-error so a path-filtered run that produced no artifact still
+# scans — Sonar reports lower coverage rather than the job hard-failing.
+#
+# `sonar.qualitygate.wait=true` in sonar-project.properties makes the scan
+# block on the Quality Gate verdict and exit with it, so this job's
+# conclusion IS the gate verdict (deterministic, in-pipeline) — independent
+# of the webhook-posted "SonarCloud Code Analysis" app check, which can race
+# (kairix#269). Whether this job is a *required* status context is the
+# caller's branch-protection / merge_group choice, not this workflow's.
+#
+# Part of three-cubes/kairix#499 Phase 4 (org CI consolidation).
+
+on:
+  workflow_call:
+    inputs:
+      fetch-depth:
+        description: >-
+          checkout fetch-depth. 0 = full history — required so Sonar can
+          compute git blame + new-code detection accurately. Anything shallow
+          makes new-code analysis unreliable.
+        type: number
+        default: 0
+      coverage-artifact-name:
+        description: >-
+          Name of the artifact (uploaded by the upstream quality-gate job)
+          carrying the coverage XML. Downloaded into the workspace so Sonar's
+          coverage sensor resolves it via sonar-project.properties. Missing
+          artifact is tolerated (continue-on-error).
+        type: string
+        default: "coverage-data"
+      test-results-artifact-name:
+        description: >-
+          Name of the artifact carrying the JUnit/xunit test-results XML
+          (e.g. test-results-unit-3.12). Downloaded for Sonar's test-execution
+          sensor. Missing artifact is tolerated (continue-on-error).
+        type: string
+        default: "test-results-unit-3.12"
+      project-key:
+        description: >-
+          Optional sonar.projectKey override. Empty string defers to the
+          projectKey declared in sonar-project.properties (the normal case).
+          Set this only when the calling repo cannot carry the key in its
+          properties file.
+        type: string
+        default: ""
+      args:
+        description: >-
+          Extra arguments appended to the scanner's `args:` (e.g.
+          -Dsonar.verbose=true). Caller-controlled, never event-derived.
+        type: string
+        default: ""
+    secrets:
+      SONAR_TOKEN:
+        description: "SonarCloud analysis token. Required — the scan can't authenticate without it."
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  sonarcloud:
+    name: SonarCloud scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Full history so Sonar computes blame + new-code detection
+          # accurately. A shallow clone silently degrades the new-code gate.
+          fetch-depth: ${{ inputs.fetch-depth }}
+
+      # ── Artifact handoff (NOT a test re-run) ────────────────────────────
+      # The upstream quality-gate job produced these; we only download them.
+      # continue-on-error: a path-filtered run may have skipped the job that
+      # uploads the artifact. Sonar then scans without imported coverage
+      # (reporting lower new-code coverage) instead of the job hard-failing.
+      - name: Download test-results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.test-results-artifact-name }}
+        continue-on-error: true
+
+      - name: Download coverage
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.coverage-artifact-name }}
+        continue-on-error: true
+
+      # ── Scan ────────────────────────────────────────────────────────────
+      # No untrusted event input is interpolated into args: project-key and
+      # args are workflow_call inputs supplied by the calling repo, never
+      # event-derived (PR titles, head_ref, commit messages). The scan action
+      # consumes SONAR_TOKEN + GITHUB_TOKEN via env passthrough only.
+      - name: SonarCloud scan
+        # Org-standard pin (v8.1.0). GitHub Actions forbids a context
+        # expression in `uses:`, so the ref is literal, not a workflow input —
+        # the whole point of a shared scan workflow is to single-source the
+        # action version. taz currently pins v6 and re-runs its suite for
+        # coverage; adopting this workflow forces v8.1.0 + artifact-handoff.
+        # That is a serves_both bump taz must verify against its merge_group
+        # SonarCloud required check before flipping the queue on.
+        uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          args: >-
+            ${{ inputs.project-key != '' && format('-Dsonar.projectKey={0}', inputs.project-key) || '' }}
+            ${{ inputs.args }}

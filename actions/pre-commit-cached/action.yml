@@ -1,0 +1,59 @@
+name: pre-commit-cached
+description: >-
+  Synced uv venv + pre-commit run, single-sourced. Wraps the
+  `setup-uv-cached` install seam followed by `pre-commit/action` so callers
+  stop hand-chaining the pair. The kairix pre-commit job's
+  arch-fitness-catalogue hook runs `uv run python3 …`, so the catalogue
+  runner needs kairix + the shared tc_fitness package importable — this
+  action syncs the venv (and puts uv on PATH) before pre-commit runs.
+  taz runs its gates directly (not through pre-commit), so kairix is the
+  only near-term consumer; the inputs stay kairix-shaped.
+inputs:
+  uv-version:
+    description: uv version to pin (forwarded to setup-uv-cached; keep in step with the org standard).
+    default: "0.11.16"
+  python-version:
+    description: Python version uv resolves against (forwarded to setup-uv-cached).
+    default: "3.12"
+  sync-args:
+    description: >-
+      Arguments to `uv sync` (forwarded to setup-uv-cached). kairix is a
+      single package — `--all-extras --all-groups` is the superset that
+      makes tc_fitness + the optional extras importable for the
+      arch-fitness-catalogue hook. Workspace repos would pass
+      `--locked --all-packages`.
+    default: "--all-extras --all-groups"
+  ci-requirements:
+    description: >-
+      Optional `--require-hashes` requirements file for CI-only tools to
+      install into the same .venv (forwarded to setup-uv-cached; empty
+      string skips that step).
+    default: ""
+  pre-commit-config:
+    description: Path to the pre-commit config file (`pre-commit/action`'s extra_args target).
+    default: ".pre-commit-config.yaml"
+  extra-args:
+    description: >-
+      Extra args appended to `pre-commit run` (e.g. `--all-files`, or a
+      hook id to scope the run). The `--config` flag is prepended
+      automatically from `pre-commit-config`.
+    default: ""
+runs:
+  using: composite
+  steps:
+    # The pre-commit hooks (notably kairix's arch-fitness-catalogue hook,
+    # which runs `uv run python3 …`) need kairix + the shared tc_fitness
+    # package importable. Sync the venv and put uv on PATH first. Reused,
+    # not re-inlined, so the install seam stays single-sourced.
+    # Self-reference stays @main until ci-workflows cuts the v1 tag (HITL).
+    - name: Locked uv install
+      uses: three-cubes/ci-workflows/actions/setup-uv-cached@main
+      with:
+        uv-version: ${{ inputs.uv-version }}
+        python-version: ${{ inputs.python-version }}
+        sync-args: ${{ inputs.sync-args }}
+        ci-requirements: ${{ inputs.ci-requirements }}
+    - name: pre-commit run
+      uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+      with:
+        extra_args: --config ${{ inputs.pre-commit-config }} ${{ inputs.extra-args }}

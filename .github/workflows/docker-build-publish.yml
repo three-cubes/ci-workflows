@@ -1,0 +1,295 @@
+name: docker-build-publish
+
+# Reusable (workflow_call) Docker image build + publish for three-cubes repos.
+# Generalized from kairix's `docker-publish.yml`: pinned buildx + the
+# docker/build-push-action two-step, with the registry login and the
+# alpha/stable/main TAG RESOLUTION exposed as inputs rather than hardcoded.
+#
+# RELEASE PATH (HITL / G4): this workflow publishes a release artefact. The
+# reusable definition is safe to land, but WIRING A CALLER and RUNNING it
+# requires explicit per-action authorization (feedback_release_hitl). Do not
+# add a caller or fire this workflow without that green light.
+#
+# Secret-free by construction (this repo is public): registry credentials are
+# never literals here. The caller logs in to the registry in its OWN job before
+# `uses:`-ing this workflow, OR passes a token via the `registry-password`
+# secret and this workflow logs in with it. Either way the credential lives in
+# the caller's org/repo secrets, never in this file.
+#
+# Per-repo differences are inputs with kairix-shaped defaults:
+#   - kairix publishes ghcr.io/three-cubes/kairix with the event-driven
+#     alpha/stable/main tag strategy and a setuptools-scm dev version on main.
+#   - taz does not currently publish an image (it deploys via VM); when/if it
+#     does it sets `image`, `tags` (explicit), and leaves `tag-strategy` at
+#     'explicit'. No kairix-specific logic runs unless `tag-strategy:
+#     kairix-release` is selected.
+#
+# Part of three-cubes/kairix#499 Phase 4 (org CI consolidation).
+
+on:
+  workflow_call:
+    inputs:
+      # ── Image identity ──────────────────────────────────────────────────
+      image:
+        description: >-
+          Fully-qualified image name WITHOUT a tag
+          (e.g. ghcr.io/three-cubes/kairix). Required — no default so a
+          mis-wired caller fails loud instead of pushing to the wrong repo.
+        type: string
+        required: true
+      registry:
+        description: "Container registry host (used for the login step)."
+        type: string
+        default: "ghcr.io"
+      # ── Build surface ───────────────────────────────────────────────────
+      build-context:
+        description: "Docker build context path passed to build-push-action."
+        type: string
+        default: "."
+      build-args:
+        description: >-
+          Multiline `KEY=value` build args (one per line), passed verbatim to
+          build-push-action's `build-args:`. When `version-source` resolves a
+          version, an extra `${version-arg-name}=<version>` line is appended
+          (kairix uses this for SETUPTOOLS_SCM_PRETEND_VERSION via
+          KAIRIX_VERSION). Empty string = no extra build args.
+        type: string
+        default: ""
+      version-arg-name:
+        description: >-
+          Build-arg name the resolved version is injected under
+          (kairix: KAIRIX_VERSION). Empty string = don't inject a version arg.
+        type: string
+        default: "KAIRIX_VERSION"
+      # ── Version + tag resolution ────────────────────────────────────────
+      version-source:
+        description: >-
+          How the image version string is computed: 'input' uses the resolved
+          ref/tag directly; 'setuptools-scm' runs `python -m setuptools_scm` on
+          the runner (full git history needed — see fetch-depth). kairix uses
+          'setuptools-scm' for the main-push dev version.
+        type: string
+        default: "setuptools-scm"
+      tag-strategy:
+        description: >-
+          How the pushed tags are derived. 'explicit' uses the `tags` input
+          verbatim (caller resolves its own tag list — the general case).
+          'kairix-release' reproduces kairix's event-driven resolution:
+            * release (prerelease)        -> <image>:<version>           (NO :latest)
+            * release (stable)            -> <image>:latest,<image>:<version>
+            * workflow_dispatch + is-alpha-> <image>:<version>           (NO :latest)
+            * workflow_dispatch (stable)  -> <image>:latest,<image>:<version>
+            * push (main/other)           -> <image>:main
+        type: string
+        default: "kairix-release"
+      tags:
+        description: >-
+          Comma-separated tag list used verbatim when tag-strategy='explicit'
+          (e.g. 'ghcr.io/org/app:1.2.3,ghcr.io/org/app:latest'). Ignored when
+          tag-strategy='kairix-release'.
+        type: string
+        default: ""
+      ref:
+        description: >-
+          Git ref to build. Defaults to the dispatch input ref on
+          workflow_dispatch, else the triggering ref. For release builds this
+          is the tag so the tagged commit is built, not the branch tip.
+        type: string
+        default: ""
+      is-alpha:
+        description: >-
+          When tag-strategy='kairix-release' and the event is
+          workflow_dispatch, 'true' tags as :<version> only (skip :latest).
+          Mirrors kairix's release-alpha.yml dispatch input.
+        type: string
+        default: "false"
+      # ── Checkout / push behaviour ───────────────────────────────────────
+      fetch-depth:
+        description: >-
+          Checkout fetch-depth. 0 = full history (REQUIRED for
+          version-source='setuptools-scm' and the kairix main-push dev version).
+        type: number
+        default: 0
+      setuptools-scm-spec:
+        description: "pip spec installed when version-source='setuptools-scm'."
+        type: string
+        default: "setuptools-scm>=8"
+      push:
+        description: "Push the built image to the registry."
+        type: boolean
+        default: true
+      load:
+        description: >-
+          Load the built image into the local Docker daemon instead of pushing
+          (mutually exclusive with push in practice; useful for build-only CI).
+        type: boolean
+        default: false
+      cache-from:
+        description: "build-push-action cache-from spec."
+        type: string
+        default: "type=gha"
+      cache-to:
+        description: "build-push-action cache-to spec."
+        type: string
+        default: "type=gha,mode=max"
+      runs-on:
+        description: "Runner label for the build job."
+        type: string
+        default: "ubuntu-latest"
+    secrets:
+      # Registry credentials stay CALLER-SIDE. A caller that already logged in
+      # to the registry in a prior job leaves these unset and sets
+      # `run-login: false`-equivalent by passing no password (the login step is
+      # skipped when registry-password is empty). kairix passes the ambient
+      # GITHUB_TOKEN as registry-password to push to ghcr.io.
+      registry-username:
+        description: >-
+          Registry username for the login step (kairix passes the github.actor
+          login via the caller's secrets). Empty + empty password = skip the
+          login step entirely.
+        required: false
+      registry-password:
+        description: >-
+          Registry password/token for the login step (kairix passes
+          secrets.GITHUB_TOKEN). Empty = skip the login step (caller logged in
+          elsewhere or this is a load-only build).
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-push:
+    name: Build and publish image
+    runs-on: ${{ inputs.runs-on }}
+    env:
+      # `secrets` is not a valid context in step-level `if:`. Capture whether a
+      # registry password was supplied at the job level so the login step can
+      # gate on a plain env var (non-empty => caller wants this workflow to log
+      # in; empty => caller logged in elsewhere or this is a load-only build).
+      HAS_REGISTRY_PASSWORD: ${{ secrets.registry-password != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Build the caller-supplied ref (a workflow_call input the caller
+          # owns — e.g. the release tag for a tagged build) so we build the
+          # tagged commit, not the default branch tip. Falls back to the
+          # triggering ref. inputs.ref is caller-controlled, not untrusted
+          # webhook payload, so it is safe in `ref:`.
+          ref: ${{ inputs.ref != '' && inputs.ref || github.ref }}
+          # Full history required so setuptools-scm can compute the main-push
+          # dev version. A shallow clone breaks version-source='setuptools-scm'.
+          fetch-depth: ${{ inputs.fetch-depth }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Login to registry
+        # Skipped when no password is supplied — the caller either logged in
+        # already in a prior job, or this is a load-only build. HAS_REGISTRY_PASSWORD
+        # is the job-level env capture of secrets.registry-password (secrets is
+        # not a valid context in `if:`).
+        if: ${{ inputs.push && env.HAS_REGISTRY_PASSWORD == 'true' }}
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.registry-username }}
+          password: ${{ secrets.registry-password }}
+
+      - name: Determine tags and version
+        id: meta
+        shell: bash
+        env:
+          IMAGE: ${{ inputs.image }}
+          TAG_STRATEGY: ${{ inputs.tag-strategy }}
+          EXPLICIT_TAGS: ${{ inputs.tags }}
+          VERSION_SOURCE: ${{ inputs.version-source }}
+          SCM_SPEC: ${{ inputs.setuptools-scm-spec }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_IS_ALPHA: ${{ inputs.is-alpha }}
+          RELEASE_IS_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+
+          # ── Resolve the version string ───────────────────────────────────
+          # Prefer an explicit ref/tag (strip a leading 'v'); fall back to the
+          # triggering ref name. When version-source='setuptools-scm' and no
+          # tag is in play, derive the dev version from git history.
+          if [ "$VERSION_SOURCE" = "setuptools-scm" ] && [ "$EVENT_NAME" != "release" ] \
+             && { [ "$EVENT_NAME" != "workflow_dispatch" ] || [ -z "$INPUT_REF" ]; }; then
+            pip install --quiet "$SCM_SPEC"
+            VERSION="$(python -m setuptools_scm 2>/dev/null || echo "0.0.0")"
+          elif [ -n "$INPUT_REF" ]; then
+            VERSION="${INPUT_REF#v}"
+          else
+            VERSION="${REF_NAME#v}"
+          fi
+
+          # ── Resolve the tag list ─────────────────────────────────────────
+          if [ "$TAG_STRATEGY" = "explicit" ]; then
+            # Caller-resolved tags used verbatim.
+            TAGS="$EXPLICIT_TAGS"
+          else
+            # kairix-release: event-driven resolution (preserves docker-publish.yml).
+            if [ "$EVENT_NAME" = "release" ] && [ "$RELEASE_IS_PRERELEASE" = "true" ]; then
+              # GitHub pre-release (alpha): version tag only, NO :latest.
+              VERSION="${REF_NAME#v}"
+              TAGS="${IMAGE}:${VERSION}"
+            elif [ "$EVENT_NAME" = "release" ]; then
+              # Stable release: version tag + :latest.
+              VERSION="${REF_NAME#v}"
+              TAGS="${IMAGE}:latest,${IMAGE}:${VERSION}"
+            elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$INPUT_IS_ALPHA" = "true" ]; then
+              # Manual dispatch for alpha: version tag only, NO :latest.
+              VERSION="${INPUT_REF#v}"
+              TAGS="${IMAGE}:${VERSION}"
+            elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              # Manual dispatch for stable backfill: treat as a stable release.
+              VERSION="${INPUT_REF#v}"
+              TAGS="${IMAGE}:latest,${IMAGE}:${VERSION}"
+            else
+              # Branch push (main): dev image, :main tag only.
+              TAGS="${IMAGE}:main"
+            fi
+          fi
+
+          {
+            echo "tags=${TAGS}"
+            echo "version=${VERSION}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Assemble build args
+        id: buildargs
+        shell: bash
+        env:
+          BASE_ARGS: ${{ inputs.build-args }}
+          VERSION_ARG_NAME: ${{ inputs.version-arg-name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Compose the caller's build-args with the resolved version arg.
+          # A heredoc keeps the multiline value intact for GITHUB_OUTPUT.
+          {
+            echo "args<<__BUILD_ARGS_EOF__"
+            if [ -n "$BASE_ARGS" ]; then
+              printf '%s\n' "$BASE_ARGS"
+            fi
+            if [ -n "$VERSION_ARG_NAME" ] && [ -n "$VERSION" ]; then
+              printf '%s=%s\n' "$VERSION_ARG_NAME" "$VERSION"
+            fi
+            echo "__BUILD_ARGS_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: ${{ inputs.build-context }}
+          push: ${{ inputs.push }}
+          load: ${{ inputs.load }}
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: ${{ steps.buildargs.outputs.args }}
+          cache-from: ${{ inputs.cache-from }}
+          cache-to: ${{ inputs.cache-to }}

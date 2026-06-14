@@ -1,0 +1,222 @@
+name: release
+
+# Reusable (workflow_call) release SPINE for three-cubes repos.
+#
+# The THIN COMMON spine only — the steps every three-cubes release shares:
+#   1. validate the CalVer tag (regex + tag-doesn't-already-exist)
+#   2. extract the matching CHANGELOG section into release notes
+#   3. create + push the annotated git tag
+#   4. `gh release create` (draft by default for human review)
+#   5. optional fan-out hook (dispatch downstream publish workflows)
+#
+# Repo-specific RELEASE GATES STAY IN THE CALLER — they are NOT generalized
+# here. kairix keeps its alpha VM-regression gate, F49 baseline-shrink, and
+# paydown-doc-currency checks in its own `release.yml` as a `needs:` job that
+# runs BEFORE it calls this reusable. taz keeps its VERSION-file trigger +
+# `release-check.sh` on its side. This spine assumes those gates have already
+# passed: a caller reaches this workflow only after its own pre-release job is
+# green.
+#
+# TOUCHES THE RELEASE PATH (HITL / G4): running a caller that invokes this
+# workflow cuts a real tag + GitHub Release and (when enabled) fans out to
+# publish. It must only be dispatched with explicit per-action authorization.
+#
+# All input values are bound through `env:` before use in `run:` scripts to
+# avoid workflow-injection via the input string.
+#
+# Part of three-cubes/kairix#499 Phase 4 (org CI consolidation).
+
+on:
+  workflow_call:
+    inputs:
+      # ── Required release coordinates ────────────────────────────────────
+      version:
+        description: "Tag to create (e.g. v2026.5.10.6). Validated against calver-pattern."
+        type: string
+        required: true
+      changelog-label:
+        description: >-
+          CHANGELOG heading whose body becomes the release notes
+          (e.g. 'Unreleased' or '2026.5.10'). Passed to changelog-extract-command.
+        type: string
+        default: "Unreleased"
+      # ── Per-repo shape ──────────────────────────────────────────────────
+      calver-pattern:
+        description: >-
+          Extended-regex (grep -E) the version must match. Default is kairix's
+          CalVer vYYYY.M.D[.N]; taz can pass its own (no leading 'v', etc.).
+        type: string
+        default: '^v[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]+)?$'
+      changelog-extract-command:
+        description: >-
+          Command that prints the release-notes body to stdout. The label is
+          exported as CHANGELOG_LABEL in the environment for the command to read.
+          Default is kairix's extractor; a repo using awk passes its own.
+        type: string
+        default: 'python scripts/extract_changelog_section.py --version "$CHANGELOG_LABEL"'
+      release-title:
+        description: >-
+          Title for the GitHub Release. The literal string $VERSION is expanded
+          to the tag at runtime (single-quoted in callers so it reaches here raw).
+        type: string
+        default: "kairix $VERSION"
+      tag-message:
+        description: >-
+          Annotation message for `git tag -a`. $VERSION expands to the tag.
+        type: string
+        default: "kairix $VERSION"
+      # ── Behaviour toggles ───────────────────────────────────────────────
+      draft:
+        description: "Create the GitHub Release as a draft for human review (recommended)."
+        type: boolean
+        default: true
+      ref:
+        description: "Git ref to check out, tag, and create the release from."
+        type: string
+        default: "main"
+      fetch-depth:
+        description: "checkout fetch-depth. 0 = full history (tag-existence + notes)."
+        type: number
+        default: 0
+      fan-out-command:
+        description: >-
+          Optional shell run AFTER the release is created, to dispatch downstream
+          publish workflows. $VERSION and $REF are exported. Empty string skips the fan-out
+          (taz has no fan-out; kairix dispatches docker-publish + publish-pypi).
+          Releases created via GITHUB_TOKEN don't auto-fan-out (GitHub's recursion
+          guard — kairix#230), so the dispatch is explicit here.
+        type: string
+        default: |
+          gh workflow run docker-publish.yml --ref "$REF" --field ref="$VERSION"
+          gh workflow run publish-pypi.yml   --ref "$REF" --field ref="$VERSION"
+    secrets:
+      # The release needs a token that can create tags + releases and (for the
+      # fan-out) dispatch other workflows. Callers wire their own token here;
+      # when omitted, the run falls back to the job's github.token.
+      gh-token:
+        description: "Token for git push / gh release / gh workflow run. Falls back to github.token."
+        required: false
+
+# tag + release creation needs write; the fan-out dispatches workflows.
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  release:
+    name: Tag + GitHub Release (from CHANGELOG)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: ${{ inputs.fetch-depth }}
+
+      - name: Validate version format
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          CALVER_PATTERN: ${{ inputs.calver-pattern }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$VERSION" | grep -Eq "$CALVER_PATTERN"; then
+            echo "::error::version '$VERSION' does not match calver-pattern '$CALVER_PATTERN'"
+            echo "fix: pass a tag matching the pattern, or override calver-pattern for this repo."
+            exit 1
+          fi
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "::error::tag '$VERSION' already exists"
+            echo "fix: bump the version input; a tag is immutable once pushed."
+            exit 1
+          fi
+
+      - name: Extract release notes from CHANGELOG
+        shell: bash
+        env:
+          CHANGELOG_LABEL: ${{ inputs.changelog-label }}
+          EXTRACT_COMMAND: ${{ inputs.changelog-extract-command }}
+        run: |
+          set -euo pipefail
+          # EXTRACT_COMMAND reads CHANGELOG_LABEL from the environment and prints
+          # the section body to stdout. eval is needed so the caller can supply a
+          # multi-token command (python … / awk …); the command source is a
+          # workflow input controlled by the caller, not untrusted run data.
+          eval "$EXTRACT_COMMAND" > /tmp/release-notes.md
+          if [ ! -s /tmp/release-notes.md ]; then
+            echo "::error::no release notes extracted for [$CHANGELOG_LABEL]"
+            echo "fix: add a '## [$CHANGELOG_LABEL]' section to CHANGELOG.md, or pass the right changelog-label."
+            exit 1
+          fi
+          echo "::group::Release notes preview"
+          cat /tmp/release-notes.md
+          echo "::endgroup::"
+
+      - name: Tag ref
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          TAG_MESSAGE: ${{ inputs.tag-message }}
+          GH_TOKEN: ${{ secrets.gh-token || github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Expand $VERSION inside the message template the caller supplied.
+          message=$(VERSION="$VERSION" envsubst <<< "$TAG_MESSAGE")
+          git tag -a "$VERSION" -m "$message"
+          git push origin "$VERSION"
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.gh-token || github.token }}
+          VERSION: ${{ inputs.version }}
+          RELEASE_TITLE: ${{ inputs.release-title }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          set -euo pipefail
+          # Draft (default) lands the Release for operator review of the rendered
+          # CHANGELOG notes before Publish. The git tag (and any artefacts built
+          # from its SHA) ship deterministically regardless of draft state, so the
+          # gate is on the operator-facing notes only.
+          title=$(VERSION="$VERSION" envsubst <<< "$RELEASE_TITLE")
+          draft_flag=()
+          if [ "$DRAFT" = "true" ]; then
+            draft_flag=(--draft)
+          fi
+          gh release create "$VERSION" \
+              --title "$title" \
+              --notes-file /tmp/release-notes.md \
+              --verify-tag \
+              "${draft_flag[@]}"
+
+      - name: Fan out to downstream publish workflows
+        if: inputs.fan-out-command != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.gh-token || github.token }}
+          VERSION: ${{ inputs.version }}
+          REF: ${{ inputs.ref }}
+          FAN_OUT_COMMAND: ${{ inputs.fan-out-command }}
+        run: |
+          set -euo pipefail
+          # Caller-supplied dispatch command(s). VERSION + REF are exported for it.
+          eval "$FAN_OUT_COMMAND"
+
+      - name: Summary
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          {
+            echo "## Release $VERSION"
+            echo ""
+            echo "- Tag pushed: \`$VERSION\`"
+            if [ "$DRAFT" = "true" ]; then
+              echo "- GitHub Release created as a **draft** (notes from CHANGELOG) — review then Publish."
+            else
+              echo "- GitHub Release published (notes from CHANGELOG)."
+            fi
+            echo "- Downstream publishes: dispatched via fan-out-command (when set)."
+          } >> "$GITHUB_STEP_SUMMARY"
