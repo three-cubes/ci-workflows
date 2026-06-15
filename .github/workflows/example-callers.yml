@@ -1,0 +1,203 @@
+name: example-callers (reusable self-check)
+
+# DRY self-check for the Phase 4 reusable workflows. Every job here `uses:` one
+# of the new reusables via its LOCAL path (./.github/workflows/<x>.yml) with
+# BOTH a kairix-shaped and a taz-shaped input set. The point is STATIC call-graph
+# validation: actionlint and GitHub's reusable-workflow resolver check input
+# names, required-input presence, types, and secret shapes against the reusable's
+# `workflow_call:` contract at parse time — so an input a consumer would pass that
+# the reusable doesn't accept (or a required input a consumer omits) fails HERE,
+# in ci-workflows' own CI, rather than later in kairix's or taz's pipeline.
+#
+# This workflow NEVER runs the underlying work by default:
+#   * `workflow_dispatch` only — never on push/PR, so it can't fire on a merge.
+#   * every job is gated on `if: ${{ inputs.run-for-real == 'true' }}`, whose
+#     default is 'false' — the call graph is validated statically (actionlint +
+#     the reusable-workflow resolver check inputs/secrets at parse time regardless
+#     of the gate); the bodies (which need a real Dockerfile, kairix/taz scripts, a
+#     SonarCloud token, or the release path) never execute under the default
+#     dispatch. A bare `if: false` is rejected by actionlint as a constant
+#     expression, so the gate reads a dispatch input instead. The release/docker
+#     jobs MUST stay gated: they touch the HITL release path (feedback_release_hitl
+#     / G4) and would only ever run with explicit per-action authorization + real
+#     secrets wired, which this self-check deliberately does not carry.
+#
+# Secret-free by construction: the one required secret (sonar-scan's SONAR_TOKEN)
+# is wired to a clearly-dummy literal so the shape resolves; the gate keeps the
+# dummy from ever authenticating anything. No real credential appears.
+#
+# Part of three-cubes/kairix#499 Phase 4 (org CI consolidation).
+
+on:
+  workflow_dispatch:
+    inputs:
+      run-for-real:
+        description: >-
+          Leave 'false' (default) for the static call-graph self-check — every
+          job stays gated off and only the input/secret SHAPES are validated.
+          Flipping to 'true' would attempt to actually run the reusables, which
+          needs real repo scripts / images / tokens and (for release + docker)
+          explicit HITL authorization; this self-check is not the place for that.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ── sonar-scan ────────────────────────────────────────────────────────────
+  # Required secret SONAR_TOKEN must be passed for the call shape to resolve;
+  # a clearly-dummy literal keeps the file secret-free and the run-for-real gate
+  # means it never authenticates.
+  sonar-kairix:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/sonar-scan.yml
+    with:
+      fetch-depth: 0
+      coverage-artifact-name: coverage-data
+      test-results-artifact-name: test-results-unit-3.12
+      args: -Dsonar.verbose=false
+    secrets:
+      SONAR_TOKEN: dummy-not-a-real-token-shape-check-only
+
+  sonar-taz:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/sonar-scan.yml
+    with:
+      # taz carries its projectKey in-workflow rather than properties, and runs
+      # a single coverage artifact under its own name.
+      project-key: three-cubes_taz
+      coverage-artifact-name: taz-coverage
+      test-results-artifact-name: taz-test-results
+    secrets:
+      SONAR_TOKEN: dummy-not-a-real-token-shape-check-only
+
+  # ── mutation-gate ─────────────────────────────────────────────────────────
+  mutation-kairix:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/mutation-gate.yml
+    with:
+      # kairix-shaped: the working pip-editable nightly suite, tesseract apt,
+      # diff-scoped to the last release tag, python-only.
+      runner-command: python scripts/checks/mutation_parity.py
+      runner-args: --base "$BASE" --baseline "$BASELINE_PATH" --write-baseline
+      baseline-path: .architecture/baseline/mutation-survivors-files.txt
+      diff-base-strategy: last-release-tag
+      install-mode: pip
+      pip-install-args: -e .[dev,agents,markitdown,pdf_fallback,ocr,pptx,docx,xlsx]
+      apt-packages: tesseract-ocr
+      language-partition: python
+      timeout-minutes: 60
+      restrict-to-main: true
+
+  mutation-taz:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/mutation-gate.yml
+    with:
+      # taz-shaped (post-#296): uv install, both language partitions, no apt
+      # extras, previous-commit diff scope, ratchet baseline under taz's path.
+      runner-command: make mutation-check
+      runner-args: ""
+      baseline-path: .mutation/survivors.txt
+      diff-base-strategy: previous-commit
+      install-mode: uv
+      uv-sync-args: --all-extras --all-groups
+      apt-packages: ""
+      language-partition: both
+      node-version: "20"
+      pnpm-version: 10.27.0
+      timeout-minutes: 45
+      restrict-to-main: false
+
+  # ── docker-build-publish (HITL release path — stays gated off) ────────────
+  docker-kairix:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/docker-build-publish.yml
+    with:
+      # kairix-shaped: ghcr image, event-driven kairix-release tag strategy,
+      # setuptools-scm version, KAIRIX_VERSION build arg, push.
+      image: ghcr.io/three-cubes/kairix
+      registry: ghcr.io
+      version-source: setuptools-scm
+      version-arg-name: KAIRIX_VERSION
+      tag-strategy: kairix-release
+      fetch-depth: 0
+      push: true
+    secrets:
+      registry-username: dummy-actor
+      registry-password: dummy-token-shape-check-only
+
+  docker-taz:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/docker-build-publish.yml
+    with:
+      # taz-shaped: explicit tag list, input-derived version, no version build
+      # arg, load-only build (taz deploys via VM, doesn't push an image today),
+      # so no registry login secret is wired.
+      image: ghcr.io/three-cubes/taz
+      version-source: input
+      version-arg-name: ""
+      tag-strategy: explicit
+      tags: ghcr.io/three-cubes/taz:dry,ghcr.io/three-cubes/taz:latest
+      push: false
+      load: true
+
+  # ── fresh-install-smoke ────────────────────────────────────────────────────
+  fresh-smoke-kairix:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/fresh-install-smoke.yml
+    with:
+      # kairix-shaped: ghcr image name, KAIRIX_IMAGE_TAG compose env, F81 script.
+      image-name: ghcr.io/three-cubes/kairix
+      image-tag: fresh-smoke
+      build-context: .
+      dockerfile: Dockerfile
+      smoke-script: scripts/checks/check-fresh-install-smoke.sh
+      smoke-env-var-name: KAIRIX_IMAGE_TAG
+      timeout-minutes: 45
+
+  fresh-smoke-taz:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/fresh-install-smoke.yml
+    with:
+      # taz-shaped: different image name, compose env var, a nested Dockerfile
+      # path and its own smoke script.
+      image-name: ghcr.io/three-cubes/taz
+      image-tag: taz-smoke
+      build-context: deploy
+      dockerfile: docker/Dockerfile
+      smoke-script: scripts/smoke/fresh-install.sh
+      smoke-env-var-name: TAZ_IMAGE_TAG
+      timeout-minutes: 30
+
+  # ── release (HITL release path — stays gated off) ──────────────────────────
+  release-kairix:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/release.yml
+    with:
+      # kairix-shaped: CalVer vYYYY.M.D[.N], python changelog extractor, draft
+      # for human review, default fan-out to docker-publish + publish-pypi.
+      version: v2026.5.10.6
+      changelog-label: "2026.5.10"
+      release-title: kairix $VERSION
+      tag-message: kairix $VERSION
+      draft: true
+      ref: main
+    secrets:
+      gh-token: dummy-token-shape-check-only
+
+  release-taz:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/release.yml
+    with:
+      # taz-shaped: its own calver pattern (no leading v), an awk extractor, a
+      # taz release title, and NO fan-out (empty string skips that step).
+      version: "2026.6.1"
+      calver-pattern: '^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}$'
+      changelog-label: Unreleased
+      changelog-extract-command: awk '/^## /{p=0} p; $0 ~ "## \\[" ENVIRON["CHANGELOG_LABEL"] "\\]"{p=1}' CHANGELOG.md
+      release-title: taz $VERSION
+      tag-message: taz $VERSION
+      draft: true
+      ref: main
+      fan-out-command: ""

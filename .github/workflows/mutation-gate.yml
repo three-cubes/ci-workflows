@@ -1,0 +1,312 @@
+name: mutation-gate
+
+# Reusable (workflow_call) mutation gate for three-cubes repos.
+# Generalizes kairix's WORKING nightly mutation suite: diff-scope the mutation
+# run against the last release tag, run a ratcheted surviving-mutant baseline
+# (survivors may only ever shrink), cap the wall-clock at a ceiling, and stay
+# NON-BLOCKING — the per-commit diff-scoped stage in each caller's own
+# safe-commit.sh / ci.yml is the blocking gate; this wider-scope leg is the
+# ratchet + pre-gate-debt tracker, not a per-PR required check.
+#
+# Each repo's thin caller invokes this with `uses:` on a schedule +
+# workflow_dispatch and supplies the per-repo runner command, baseline path,
+# install mode, and language partition. Repo-specific test extras / native
+# runtimes (kairix's tesseract OCR, taz's openclaw) are exposed as inputs, not
+# hard-coded.
+#
+# Defaults are kairix-shaped (the source of working substance). taz's
+# 5-mutation-testing.yml is a #296 placeholder and CANNOT consume this until
+# #296 lands its real `make mutation-check` / mutmut+stryker runner; once it
+# does, taz calls this with runner-command + language-partition: both.
+#
+# No untrusted input is referenced inside any `run:` block: every
+# workflow_call input is bound to `env:` first, never interpolated directly
+# into shell — mirrors the source workflow's injection-safe discipline.
+#
+# Part of three-cubes/kairix#499 Phase 4 (org CI consolidation).
+
+on:
+  workflow_call:
+    inputs:
+      # ── What to run ─────────────────────────────────────────────────────
+      runner-command:
+        description: >-
+          Command that runs the mutation parity check. Receives the resolved
+          diff base via the BASE env var and the baseline via BASELINE_PATH;
+          reference them as "$BASE" / "$BASELINE_PATH" in the command string.
+          Default is kairix's diff-scoped ratcheted parity runner.
+        type: string
+        default: "python scripts/checks/mutation_parity.py"
+      runner-args:
+        description: >-
+          Extra args appended to the runner command. kairix passes
+          `--baseline "$BASELINE_PATH" --write-baseline` so survivors already
+          in the ratchet do not fail and the baseline is rewritten to the
+          (never-growing) current surviving set.
+        type: string
+        default: '--base "$BASE" --baseline "$BASELINE_PATH" --write-baseline'
+      baseline-path:
+        description: >-
+          Path to the ratcheted surviving-mutant baseline file. Uploaded as an
+          artifact and (for kairix's runner) rewritten in place.
+        type: string
+        default: ".architecture/baseline/mutation-survivors-files.txt"
+      # ── Diff scope ──────────────────────────────────────────────────────
+      diff-base-strategy:
+        description: >-
+          How to resolve the mutation diff base. `last-release-tag` =
+          `git describe` of the most recent v* tag (kairix default);
+          `previous-commit` = HEAD~1; `explicit` = use diff-base-override
+          verbatim. workflow_dispatch's diff-base-override always wins.
+        type: string
+        default: "last-release-tag"
+      diff-base-override:
+        description: >-
+          Explicit diff base (e.g. v2026.6.9 or origin/main). Overrides
+          diff-base-strategy when non-empty. Wired from the caller's
+          workflow_dispatch input so an operator can re-scope a manual run.
+        type: string
+        default: ""
+      release-tag-glob:
+        description: "git tag match glob for the last-release-tag strategy."
+        type: string
+        default: "v*"
+      # ── Install surface ─────────────────────────────────────────────────
+      install-mode:
+        description: >-
+          Python dependency install seam: `uv` (org-standard locked-uv
+          composite) or `pip` (kairix's nightly suite uses an editable
+          `pip install -e .[extras]` to match Stage 2's import surface exactly).
+        type: string
+        default: "pip"
+      python-version:
+        description: "Python version (matches the unit tier so the runner imports identical code)."
+        type: string
+        default: "3.12"
+      uv-version:
+        description: "Pinned uv version when install-mode is uv."
+        type: string
+        default: "0.11.16"
+      uv-sync-args:
+        description: "`uv sync` args when install-mode is uv."
+        type: string
+        default: "--all-extras --all-groups"
+      pip-install-args:
+        description: >-
+          Args to `pip install` when install-mode is pip. kairix installs the
+          editable package plus the same extras Stage 2 uses so the mutation
+          runner's import + test surface matches the per-commit gate.
+        type: string
+        default: '-e .[dev,agents,markitdown,pdf_fallback,ocr,pptx,docx,xlsx]'
+      apt-packages:
+        description: >-
+          Space-separated apt packages installed before the run (native test
+          runtimes). kairix needs tesseract-ocr so a stray extractor ImportError
+          can't silently skip a test the runner relies on to KILL a mutant.
+          Empty string skips the step.
+        type: string
+        default: "tesseract-ocr"
+      # ── Node / TS half (taz, post-#296) ─────────────────────────────────
+      language-partition:
+        description: >-
+          Which toolchains to provision: `python`, `typescript`, or `both`.
+          kairix is python-only; taz uses both once #296 lands its
+          mutmut + stryker runner.
+        type: string
+        default: "python"
+      node-version:
+        description: "Node major/version for the pnpm setup when TS is in the partition."
+        type: string
+        default: "20"
+      pnpm-version:
+        description: "pnpm version when TS is in the partition."
+        type: string
+        default: "10.27.0"
+      # ── Resource ceilings ───────────────────────────────────────────────
+      timeout-minutes:
+        description: >-
+          Job wall-clock ceiling. kairix's per-module caps keep a
+          since-last-release delta bounded; 60 leaves headroom for slow-runner
+          variance without hanging to the 6h default.
+        type: number
+        default: 60
+      restrict-to-main:
+        description: >-
+          Skip the job unless the ref is refs/heads/main, so a
+          workflow_dispatch from a feature branch can't burn runner time.
+        type: boolean
+        default: true
+      artifact-retention-days:
+        description: "Retention for the uploaded surviving-mutant baseline artifact."
+        type: number
+        default: 30
+    secrets:
+      # Generic passthrough. The default runner needs no secret; a caller whose
+      # runner pulls a private package index or posts a notification wires it
+      # here. Never pass a literal — callers map repo/org secrets in.
+      gh-token:
+        description: "GITHUB_TOKEN override for steps that need authenticated git/gh."
+        required: false
+
+permissions: {}
+
+concurrency:
+  # Serialize per-ref: a ratcheting run must not race another that rewrites the
+  # same baseline. Do not cancel in progress — let a running ratchet finish.
+  group: mutation-gate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mutation:
+    name: "Mutation — diff-scoped, ratcheted (non-blocking)"
+    runs-on: ubuntu-latest
+    # Only run on main when restrict-to-main is true. A dispatch from a
+    # non-main branch exits without work so contributors don't burn runner time.
+    if: ${{ !inputs.restrict-to-main || github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Full history so the last-release-tag strategy can resolve and diff.
+          fetch-depth: 0
+
+      # ── Python toolchain (skipped for a typescript-only partition) ──────
+      - name: Set up Python
+        if: inputs.language-partition != 'typescript'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      # ── Node + pnpm (only when TS is in the partition) ──────────────────
+      - name: Set up pnpm
+        if: inputs.language-partition != 'python'
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+          run_install: false
+      - name: Set up Node
+        if: inputs.language-partition != 'python'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+
+      # ── Native test runtimes (apt) ──────────────────────────────────────
+      - name: Install apt packages
+        if: ${{ inputs.apt-packages != '' && inputs.language-partition != 'typescript' }}
+        shell: bash
+        env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # shellcheck disable=SC2086  # APT_PACKAGES is a space-separated package list, intentional word-split
+          sudo apt-get install -y -qq $APT_PACKAGES
+
+      # ── Python deps: uv composite OR editable pip ───────────────────────
+      - name: Locked uv install
+        if: ${{ inputs.language-partition != 'typescript' && inputs.install-mode == 'uv' }}
+        uses: three-cubes/ci-workflows/actions/setup-uv-cached@main
+        with:
+          uv-version: ${{ inputs.uv-version }}
+          python-version: ${{ inputs.python-version }}
+          sync-args: ${{ inputs.uv-sync-args }}
+
+      - name: pip install (editable + extras)
+        if: ${{ inputs.language-partition != 'typescript' && inputs.install-mode == 'pip' }}
+        shell: bash
+        env:
+          PIP_INSTALL_ARGS: ${{ inputs.pip-install-args }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086  # PIP_INSTALL_ARGS is a space-separated arg list, intentional word-split
+          pip install $PIP_INSTALL_ARGS
+
+      # ── Resolve the diff base ───────────────────────────────────────────
+      - name: Resolve diff base
+        id: base
+        shell: bash
+        env:
+          STRATEGY: ${{ inputs.diff-base-strategy }}
+          OVERRIDE: ${{ inputs.diff-base-override }}
+          TAG_GLOB: ${{ inputs.release-tag-glob }}
+        run: |
+          set -euo pipefail
+          if [ -n "${OVERRIDE}" ]; then
+            base="${OVERRIDE}"
+          elif [ "${STRATEGY}" = "last-release-tag" ]; then
+            # Most recent matching tag reachable from HEAD; fall back to the
+            # previous commit if no tag exists yet (bootstrap).
+            base="$(git describe --tags --abbrev=0 --match "${TAG_GLOB}" HEAD 2>/dev/null || echo 'HEAD~1')"
+          elif [ "${STRATEGY}" = "previous-commit" ]; then
+            base="HEAD~1"
+          elif [ "${STRATEGY}" = "explicit" ]; then
+            echo "::error title=mutation-gate::diff-base-strategy=explicit requires a non-empty diff-base-override"
+            exit 1
+          else
+            echo "::error title=mutation-gate::unknown diff-base-strategy '${STRATEGY}' (expected last-release-tag | previous-commit | explicit)"
+            exit 1
+          fi
+          echo "Resolved mutation diff base: ${base}"
+          echo "base=${base}" >> "${GITHUB_OUTPUT}"
+
+      # ── Run the mutation parity check (NON-BLOCKING) ────────────────────
+      # continue-on-error keeps this leg non-blocking exactly as kairix's
+      # nightly suite is: the per-commit diff-scoped stage is the blocking
+      # gate; a survivor here is pre-gate debt the on-call reads, not a merge
+      # blocker. The outcome is surfaced in the summary step below so a soft
+      # failure stays visible rather than silent.
+      - name: Mutation parity (diff-scoped, ratcheted)
+        id: parity
+        continue-on-error: true
+        shell: bash
+        env:
+          RUNNER_COMMAND: ${{ inputs.runner-command }}
+          RUNNER_ARGS: ${{ inputs.runner-args }}
+          BASE: ${{ steps.base.outputs.base }}
+          BASELINE_PATH: ${{ inputs.baseline-path }}
+          GITHUB_TOKEN: ${{ secrets.gh-token || github.token }}
+        run: |
+          set -euo pipefail
+          # RUNNER_COMMAND + RUNNER_ARGS are caller-supplied command strings;
+          # BASE / BASELINE_PATH are exported above for them to reference.
+          # eval is required so the caller's quoted "$BASE" / "$BASELINE_PATH"
+          # expand here — both are bound to env, never raw-interpolated.
+          eval "${RUNNER_COMMAND} ${RUNNER_ARGS}"
+
+      - name: Surface mutation outcome
+        if: always()
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.parity.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "${OUTCOME}" = "success" ]; then
+            echo "::notice title=mutation-gate::Mutation parity passed — surviving-mutant baseline did not grow."
+          else
+            echo "::warning title=mutation-gate::Mutation parity reported survivors or errored (outcome=${OUTCOME}). Non-blocking; on-call reads this. The blocking gate is the per-commit diff-scoped stage."
+          fi
+
+      - name: Show ratcheted baseline diff
+        if: always()
+        shell: bash
+        env:
+          BASELINE_PATH: ${{ inputs.baseline-path }}
+        run: |
+          set -euo pipefail
+          echo "=== ${BASELINE_PATH} after this run ==="
+          # Diagnostic-only render; never fail the run on a diff-render hiccup.
+          git --no-pager diff -- "${BASELINE_PATH}" || true  # F83: diagnostic render, soft by design
+
+      - name: Upload surviving-mutant baseline
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mutation-survivors
+          path: ${{ inputs.baseline-path }}
+          if-no-files-found: warn
+          retention-days: ${{ inputs.artifact-retention-days }}
