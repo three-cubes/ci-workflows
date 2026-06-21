@@ -36,6 +36,9 @@ jobs:
     name: Quality gate
     uses: three-cubes/ci-workflows/.github/workflows/meta-quality-gate.yml@v1
     with:
+      # Composites live under .github/actions here, not a top-level actions/.
+      yamllint-paths: ".github/workflows .github/actions"
+    with:
       # Composite actions live under .github/actions here (not a top-level
       # actions/), so point yamllint at the real YAML locations instead of the
       # meta-gate's ci-workflows-shaped default.
