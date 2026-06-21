@@ -4,11 +4,14 @@ name: sonar-scan
 # ARTIFACT-HANDOFF shape mandated by three-cubes/kairix#499 Phase 4.
 #
 # This job does NOT run the test suite. It DOWNLOADS the coverage XML and
-# JUnit test-results artifacts that an upstream quality-gate job already
-# produced, then runs the Sonar scanner against the working tree + those
-# imported reports. Re-running pytest here purely to regenerate coverage is
-# the #499 anti-pattern this workflow exists to remove: it doubles CI minutes
-# and lets the scan silently disagree with the gate's own coverage.
+# JUnit test-results artifacts that the upstream `python-quality-gate.yml`
+# job already produced — that gate runs `uv run tc-fitness run`, and the
+# fitness engine writes the coverage XML the gate then uploads as the
+# `coverage-data` artifact. This job runs the Sonar scanner against the
+# working tree + those imported reports. Re-running pytest here purely to
+# regenerate coverage is the #499 anti-pattern this workflow exists to
+# remove: it doubles CI minutes and lets the scan silently disagree with the
+# gate's own (engine-produced) coverage.
 #
 # Coverage + test-results paths are read by Sonar from the repo's
 # `sonar-project.properties` (sonar.python.coverage.reportPaths,

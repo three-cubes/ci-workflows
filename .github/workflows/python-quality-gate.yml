@@ -1,21 +1,30 @@
+---
 name: python-quality-gate
 
 # Reusable (workflow_call) Python quality gate for three-cubes repos.
-# Encodes the org-standard locked-uv pattern: the `setup-uv-cached` composite
-# (pinned setup-uv + cached `uv sync` + optional `--require-hashes` CI tools)
-# followed by the generic lint / type / security / test / coverage steps.
 #
-# Each repo's thin `ci.yml` calls this with `uses:` and opts into the steps it
-# actually runs via the capability toggles. Repo-specific steps (taz's openclaw
-# / llm-judge / fitness harness, kairix's arch-fitness / union-coverage / Docker)
-# stay in the caller — they are NOT generalized here.
+# The gate's STEPS are owned by the fitness engine (three-cubes-fitness, the
+# `tc-fitness` CLI), not by this workflow. The consuming repo declares its gate
+# — dep-install, the exact pytest invocation (test dirs + --cov roots + markers
+# + -n auto), ruff/bandit targets, detect-secrets baseline, and its
+# check-catalogue module — in a repo-local `[tool.tc_fitness]` block (or
+# `.tc-fitness.toml`). `uv run tc-fitness run` reads that config and runs the
+# gate in order from one Python entrypoint. The SAME binary + SAME config is
+# what `make check` runs locally, so local == CI by construction.
+#
+# This workflow therefore owns only the GitHub Actions ENVIRONMENT around that
+# one command: provisioning a pinned/cached uv venv, the optional Node/TS half
+# (a separate ecosystem the Python engine does not orchestrate), repo-specific
+# pre/post orchestration hooks, and the coverage-artifact handoff to
+# `sonar-scan.yml`. Repo-specific gate STEPS are config in the engine, never
+# inputs here — that is the whole point of the convergence.
 #
 # Part of three-cubes/kairix#499 Phase 4 (org CI consolidation).
 
 on:
   workflow_call:
     inputs:
-      # ── Toolchain pins ──────────────────────────────────────────────────
+      # ── Toolchain pins (forwarded to setup-uv-cached) ───────────────────
       python-version:
         description: "Python version uv resolves against."
         type: string
@@ -25,87 +34,64 @@ on:
         type: string
         default: "0.11.16"
       fetch-depth:
-        description: "checkout fetch-depth. 0 = full history (secret scanning); 2 = HEAD~1 for changed-file diffs."
+        description: "checkout fetch-depth. 0 = full history (secret scanning / new-code); 2 = HEAD~1 for changed-file diffs."
         type: number
         default: 2
-      # ── Install surface ─────────────────────────────────────────────────
+      # ── Install surface (forwarded to setup-uv-cached) ──────────────────
       sync-args:
         description: >-
           Arguments to `uv sync`. Workspace repos use `--locked --all-packages`;
-          single-package repos use e.g. `--all-extras --all-groups`.
+          single-package repos use e.g. `--all-extras --all-groups`. Must agree
+          with the dep-install the engine config declares for local runs.
         type: string
         default: "--locked --all-packages"
       ci-requirements-path:
         description: >-
-          `--require-hashes` requirements file for CI-only tools (pytest, ruff,
-          bandit, …) installed into the same .venv. Empty string skips the step.
+          `--require-hashes` requirements file for CI-only tools installed into
+          the same .venv before the gate runs. Empty string skips the step.
         type: string
         default: ".github/requirements-ci.txt"
-      # ── Lint / type / security targets ──────────────────────────────────
-      ruff-lint-paths:
-        description: "Paths passed to `ruff check`."
+      # ── The gate ────────────────────────────────────────────────────────
+      tc-fitness-args:
+        description: >-
+          Arguments to the engine CLI. Default `run` executes the full gate
+          declared in the repo's `[tool.tc_fitness]` config. Override e.g.
+          `run --select lint,pytest` or `run --changed-only`.
         type: string
-        default: "scripts/ tests/"
-      ruff-lint-args:
-        description: "Extra args for `ruff check` (e.g. --ignore=...)."
+        default: "run"
+      pre-steps:
+        description: >-
+          Optional bash run before `tc-fitness run`, for repo-specific
+          orchestration that genuinely cannot be a config-declared check
+          (e.g. a render smoke). Empty string skips.
         type: string
         default: ""
-      ruff-format-paths:
-        description: "Paths passed to `ruff format --check`."
-        type: string
-        default: "scripts/ tests/"
-      bandit-paths:
-        description: "Paths passed to `bandit -r`."
-        type: string
-        default: "scripts/"
-      bandit-args:
-        description: "Extra args for bandit (e.g. -ll -ii -c pyproject.toml)."
-        type: string
-        default: "-ll -ii -c pyproject.toml"
-      mypy-paths:
-        description: "Paths passed to `mypy`."
-        type: string
-        default: "kairix/"
-      mypy-args:
-        description: "Extra args for mypy."
-        type: string
-        default: "--ignore-missing-imports"
-      compileall-paths:
-        description: "Paths passed to `python -m compileall`."
-        type: string
-        default: "scripts tests"
-      shellcheck-find-paths:
-        description: "Roots searched for *.sh files to shellcheck."
-        type: string
-        default: "scripts"
-      # ── Test + coverage ─────────────────────────────────────────────────
-      pytest-args:
-        description: "Args for `uv run pytest` (selector, parallelism, junit, …)."
-        type: string
-        default: "-q tests -n auto"
-      coverage-paths:
+      post-steps:
         description: >-
-          Space-separated `--cov=<path>` sources (passed verbatim, each prefixed
-          with --cov= by the caller-facing default below). Empty string disables
-          coverage flags.
+          Optional bash run after `tc-fitness run` (always runs unless the gate
+          step itself was skipped). Empty string skips.
         type: string
-        default: "--cov=scripts --cov=tests/lib"
-      coverage-xml:
-        description: "Path the coverage XML is written to."
+        default: ""
+      # ── Coverage-artifact handoff to sonar-scan.yml ─────────────────────
+      upload-coverage-artifact:
+        description: "Upload the engine-produced coverage XML as an artifact for the downstream Sonar scan."
+        type: boolean
+        default: true
+      coverage-xml-path:
+        description: >-
+          Path the engine writes coverage XML to (must match the repo's
+          sonar-project.properties `sonar.python.coverage.reportPaths`).
         type: string
         default: "coverage.xml"
-      coverage-fail-under:
-        description: "`--cov-fail-under` floor (0 defers to a separate ratchet)."
-        type: number
-        default: 0
-      normalize-coverage-script:
-        description: >-
-          Optional path to a coverage-XML normaliser run after pytest
-          (collapses multi-source paths to a repo-root anchor for Sonar).
-          Empty string skips.
+      coverage-artifact-name:
+        description: "Artifact name the downstream sonar-scan job downloads."
         type: string
-        default: ""
-      # ── Node / TS half (taz) ────────────────────────────────────────────
+        default: "coverage-data"
+      # ── Node / TS half (opt-in — a separate ecosystem) ──────────────────
+      run-node:
+        description: "Run the pnpm/TS half (install + TS coverage) alongside the Python gate."
+        type: boolean
+        default: false
       node-version-file:
         description: "Path to the Node version file (.nvmrc) when run-node is true."
         type: string
@@ -122,54 +108,9 @@ on:
         description: "Command run for the TS coverage half when run-node is true."
         type: string
         default: "pnpm -r --if-present test:coverage"
-      # ── detect-secrets ──────────────────────────────────────────────────
-      detect-secrets-baseline:
-        description: "Path to the detect-secrets baseline."
-        type: string
-        default: ".secrets.baseline"
-      # ── Capability toggles ──────────────────────────────────────────────
-      run-shellcheck:
-        description: "Install shellcheck and lint discovered *.sh files."
-        type: boolean
-        default: true
-      run-ruff-lint:
-        description: "Run `ruff check` (blocking)."
-        type: boolean
-        default: true
-      run-ruff-format-check:
-        description: "Run `ruff format --check` (non-blocking — drains via ratchet)."
-        type: boolean
-        default: true
-      run-bandit:
-        description: "Run bandit SAST."
-        type: boolean
-        default: true
-      run-compileall:
-        description: "Run `python -m compileall` as a syntax gate."
-        type: boolean
-        default: true
-      run-mypy:
-        description: "Run mypy type checking (taz: off; kairix: on)."
-        type: boolean
-        default: false
-      run-pytest:
-        description: "Run the pytest + coverage step."
-        type: boolean
-        default: true
-      run-node:
-        description: "Run the pnpm/TS half (install + TS coverage)."
-        type: boolean
-        default: false
-      run-detect-secrets:
-        description: "Run the detect-secrets changed-file scan."
-        type: boolean
-        default: true
     secrets:
-      # Generic credential passthrough. Callers wire repo/org secrets here;
-      # repo-specific secrets (SONAR_TOKEN, CLI_PROXY_API_*, …) stay in the
-      # caller's own steps, not this generic gate.
       gh-token:
-        description: "GITHUB_TOKEN override for steps that need authenticated git/gh."
+        description: "GITHUB_TOKEN override for steps that need authenticated git/gh (engine secret-scan changed-file diff). Falls back to github.token."
         required: false
 
 permissions:
@@ -202,95 +143,32 @@ jobs:
         shell: bash
         run: pnpm install ${{ inputs.pnpm-install-args }}
 
-      # ── Locked-uv install (org composite) ───────────────────────────────
-      # The composite performs the two-step install in one place:
-      #   1. pinned setup-uv (cache enabled)
-      #   2. `uv sync <sync-args>`        — workspace/package deps
-      #   3. `uv pip install --require-hashes --only-binary :all: -r <ci-req>`
-      #      — CI-only tools into the same .venv (skipped when ci-req empty)
-      # Reused (not re-inlined) so the install seam stays single-sourced.
+      # ── Locked-uv install (org composite, self-pinned to v1) ────────────
+      # Provisions the pinned/cached uv venv + repo deps + optional CI tools so
+      # `tc-fitness run` has its interpreter and dependencies ready.
       - name: Locked uv install
-        uses: three-cubes/ci-workflows/actions/setup-uv-cached@main
+        uses: three-cubes/ci-workflows/actions/setup-uv-cached@v1
         with:
           uv-version: ${{ inputs.uv-version }}
           python-version: ${{ inputs.python-version }}
           sync-args: ${{ inputs.sync-args }}
           ci-requirements: ${{ inputs.ci-requirements-path }}
 
-      # ── Lint / type / security (each opt-in) ────────────────────────────
-      - name: Install shellcheck
-        if: inputs.run-shellcheck
+      # ── Repo-specific pre-orchestration (opt-in) ────────────────────────
+      - name: Pre-steps
+        if: inputs.pre-steps != ''
         shell: bash
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck
-      - name: Shell lint
-        if: inputs.run-shellcheck
+        run: ${{ inputs.pre-steps }}
+
+      # ── THE GATE — one binary, the repo's own config ────────────────────
+      # `tc-fitness run` reads `[tool.tc_fitness]` (or .tc-fitness.toml) from
+      # the checked-out repo and runs the declared gate in order. This is the
+      # SAME command `make check` runs locally — local == CI by construction.
+      - name: Fitness gate
         shell: bash
         env:
-          FIND_PATHS: ${{ inputs.shellcheck-find-paths }}
-        run: |
-          # shellcheck disable=SC2086  # FIND_PATHS is a space-separated root list, intentional word-split
-          mapfile -t targets < <(find $FIND_PATHS -type f -name "*.sh" 2>/dev/null)
-          if [[ ${#targets[@]} -eq 0 ]]; then
-            echo "No shell scripts found; skipping."
-            exit 0
-          fi
-          shellcheck --severity=warning "${targets[@]}"
-
-      - name: Ruff lint
-        if: inputs.run-ruff-lint
-        shell: bash
-        run: uv run ruff check ${{ inputs.ruff-lint-paths }} ${{ inputs.ruff-lint-args }}
-
-      - name: Ruff format (non-blocking)
-        if: inputs.run-ruff-format-check
-        shell: bash
-        # Non-blocking: format drains via the per-file Sonar ratchet, not a
-        # bootstrap-time --fix sweep. `|| true` keeps the gate green while the
-        # pool drains; the ratchet stays hard-fail in the caller.
-        run: uv run ruff format --check ${{ inputs.ruff-format-paths }} || true
-
-      - name: Bandit
-        if: inputs.run-bandit
-        shell: bash
-        run: uv run bandit -r ${{ inputs.bandit-paths }} ${{ inputs.bandit-args }}
-
-      - name: Python compile
-        if: inputs.run-compileall
-        shell: bash
-        run: uv run python -m compileall -q ${{ inputs.compileall-paths }}
-
-      - name: Type checking — mypy
-        if: inputs.run-mypy
-        shell: bash
-        run: uv run mypy ${{ inputs.mypy-paths }} ${{ inputs.mypy-args }}
-
-      # ── Tests + coverage ────────────────────────────────────────────────
-      - name: Pytest (with coverage)
-        if: inputs.run-pytest
-        shell: bash
-        env:
-          PYTEST_ARGS: ${{ inputs.pytest-args }}
-          COVERAGE_PATHS: ${{ inputs.coverage-paths }}
-          COVERAGE_XML: ${{ inputs.coverage-xml }}
-          COVERAGE_FAIL_UNDER: ${{ inputs.coverage-fail-under }}
-          NORMALIZE_SCRIPT: ${{ inputs.normalize-coverage-script }}
-        run: |
-          if find tests -type f -name 'test_*.py' 2>/dev/null | grep -q .; then
-            # shellcheck disable=SC2086  # *_ARGS / *_PATHS are space-separated arg lists, intentional word-split
-            uv run pytest $PYTEST_ARGS \
-              $COVERAGE_PATHS \
-              --cov-branch \
-              --cov-report=xml:"$COVERAGE_XML" \
-              --cov-report=term-missing \
-              --cov-fail-under="$COVERAGE_FAIL_UNDER"
-            if [[ -n "$NORMALIZE_SCRIPT" ]]; then
-              uv run --frozen python "$NORMALIZE_SCRIPT" --xml "$COVERAGE_XML" --repo-root "$GITHUB_WORKSPACE"
-            fi
-          else
-            echo "No tests/test_*.py present; skipping pytest."
-          fi
+          GITHUB_TOKEN: ${{ secrets.gh-token || github.token }}
+        run: uv run tc-fitness ${{ inputs.tc-fitness-args }}
 
       # ── TS coverage half (opt-in) ───────────────────────────────────────
       - name: TypeScript coverage
@@ -298,25 +176,22 @@ jobs:
         shell: bash
         run: ${{ inputs.ts-coverage-command }}
 
-      # ── detect-secrets changed-file scan (opt-in) ───────────────────────
-      - name: detect-secrets changed-file scan
-        if: inputs.run-detect-secrets
+      # ── Repo-specific post-orchestration (opt-in) ───────────────────────
+      - name: Post-steps
+        if: inputs.post-steps != ''
         shell: bash
-        env:
-          BASE_REF: ${{ github.base_ref }}
-          EVENT_NAME: ${{ github.event_name }}
-          BASELINE: ${{ inputs.detect-secrets-baseline }}
-          GITHUB_TOKEN: ${{ secrets.gh-token || github.token }}
-        run: |
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            git fetch origin "$BASE_REF" --depth=1
-            mapfile -t files < <(git diff --name-only --diff-filter=ACMRTUXB "origin/${BASE_REF}...HEAD")
-          else
-            # First push commits may not have HEAD~1; fall back to an empty list.
-            mapfile -t files < <(git diff --name-only --diff-filter=ACMRTUXB HEAD~1..HEAD 2>/dev/null || true)
-          fi
-          if [[ ${#files[@]} -eq 0 ]]; then
-            echo "No changed files to scan."
-          else
-            uv run detect-secrets-hook --baseline "$BASELINE" "${files[@]}"
-          fi
+        run: ${{ inputs.post-steps }}
+
+      # ── Coverage-artifact handoff to sonar-scan.yml ─────────────────────
+      # The engine wrote coverage XML at coverage-xml-path; upload it so the
+      # downstream sonar-scan job imports it instead of re-running pytest
+      # (the #499 artifact-handoff shape). always() so a gate failure that
+      # still produced partial coverage doesn't strand the artifact.
+      - name: Upload coverage artifact
+        if: ${{ always() && inputs.upload-coverage-artifact }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.coverage-artifact-name }}
+          path: ${{ inputs.coverage-xml-path }}
+          if-no-files-found: ignore
+          retention-days: 1

@@ -44,10 +44,10 @@ runs:
     # The pre-commit hooks (notably kairix's arch-fitness-catalogue hook,
     # which runs `uv run python3 …`) need kairix + the shared tc_fitness
     # package importable. Sync the venv and put uv on PATH first. Reused,
-    # not re-inlined, so the install seam stays single-sourced.
-    # Self-reference stays @main until ci-workflows cuts the v1 tag (HITL).
+    # not re-inlined, so the install seam stays single-sourced. Self-pinned to
+    # the repo's own released tag.
     - name: Locked uv install
-      uses: three-cubes/ci-workflows/actions/setup-uv-cached@main
+      uses: three-cubes/ci-workflows/actions/setup-uv-cached@v1
       with:
         uv-version: ${{ inputs.uv-version }}
         python-version: ${{ inputs.python-version }}
