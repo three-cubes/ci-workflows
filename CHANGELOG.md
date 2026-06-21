@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `three-cubes/ci-workflows` are documented here.
+All notable changes to `three-cubes/tc-pipelines` are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
@@ -29,7 +29,7 @@ for the consumer-facing `@vN` workflow/action references.
   as the `coverage-data` artifact, completing the artifact-handoff to
   `sonar-scan.yml` from within the converged single job.
 - Self-pinned both composites and the reusable gate to
-  `three-cubes/ci-workflows/actions/setup-uv-cached@v1` (was `@main`),
+  `three-cubes/tc-pipelines/actions/setup-uv-cached@v1` (was `@main`),
   honouring the repo's own "pin @vN" principle.
 
 ### Added
@@ -70,5 +70,5 @@ First tagged baseline of the org-shared CI surface (kairix#499 Phase 4).
   and `pre-commit-cached` (synced venv + pre-commit run).
 - `ci.yml` self-check running `actionlint`.
 
-[Unreleased]: https://github.com/three-cubes/ci-workflows/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/three-cubes/ci-workflows/releases/tag/v1.0.0
+[Unreleased]: https://github.com/three-cubes/tc-pipelines/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/three-cubes/tc-pipelines/releases/tag/v1.0.0

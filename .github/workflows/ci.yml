@@ -1,19 +1,20 @@
 ---
-name: ci-workflows self-check
+name: tc-pipelines self-check
 on:
   push: { branches: [main] }
   pull_request:
 permissions:
   contents: read
 jobs:
-  # Dogfood: ci-workflows runs the very meta gate it ships. A local-path
+  # Dogfood: tc-pipelines runs the very meta gate it ships. A local-path
   # `uses:` (./.github/workflows/meta-quality-gate.yml) wires this self-check to
   # the reusable's actionlint / yamllint / license / branch-naming legs, so a
   # regression in the shipped gate fails HERE before any consumer adopts it.
-  # The legs keep their previous behaviour: yamllint scans the same paths with
-  # the same relaxed config, and the LICENSE assertion expects Apache-2.0.
+  # yamllint scans all three YAML roots: the reusable workflows, the CI install
+  # composites (top-level actions/), and the Azure deploy composites
+  # (.github/actions/). The LICENSE assertion expects Apache-2.0.
   meta:
     uses: ./.github/workflows/meta-quality-gate.yml
     with:
-      yamllint-paths: ".github/workflows actions"
+      yamllint-paths: ".github/workflows actions .github/actions"
       spdx-id: "Apache-2.0"
