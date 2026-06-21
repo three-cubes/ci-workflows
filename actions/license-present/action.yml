@@ -1,0 +1,76 @@
+name: license-present
+description: >-
+  Assert the repo carries a top-level LICENSE file declaring the expected
+  license. The single-sourced provenance gate for three-cubes repos: a repo
+  distributed without its license loses the terms it was released under, and an
+  audit can't tell which license governs it. This checks the WHOLE-REPO license
+  declaration (the LICENSE file), distinct from the fitness engine's
+  per-source-file `license_present` header check.
+inputs:
+  license-file:
+    description: Path to the license file to assert (relative to the workspace root).
+    default: "LICENSE"
+  spdx-id:
+    description: >-
+      Expected SPDX license identifier (e.g. `Apache-2.0`, `MIT`,
+      `BSD-3-Clause`). The action asserts the LICENSE file matches this id —
+      either via an explicit `SPDX-License-Identifier: <id>` line or via the
+      known body-marker phrases for the recognised ids below.
+    default: "Apache-2.0"
+runs:
+  using: composite
+  steps:
+    # The SPDX id and file path are env-bound (never interpolated into the
+    # script body), so a caller-supplied value can't break out of the string
+    # context — injection-safe per the org workflow standard.
+    - name: Assert LICENSE present and matches the expected SPDX id
+      shell: bash
+      env:
+        LICENSE_FILE: ${{ inputs.license-file }}
+        SPDX_ID: ${{ inputs.spdx-id }}
+      run: |
+        set -euo pipefail
+
+        if [[ ! -f "$LICENSE_FILE" ]]; then
+          echo "::error::license-present: '$LICENSE_FILE' missing." \
+            "fix: add a top-level $LICENSE_FILE declaring $SPDX_ID." >&2
+          exit 1
+        fi
+
+        # An explicit SPDX-License-Identifier line is authoritative if present.
+        if grep -qiF "SPDX-License-Identifier: ${SPDX_ID}" "$LICENSE_FILE"; then
+          echo "license-present: '$LICENSE_FILE' declares $SPDX_ID (SPDX line)."
+          exit 0
+        fi
+
+        # Otherwise match the body markers for the recognised ids. Each id maps
+        # to two phrases that must BOTH appear (name + version/clause) so a
+        # near-miss license can't false-pass.
+        marker_a=""
+        marker_b=""
+        case "$SPDX_ID" in
+          Apache-2.0)    marker_a="Apache License";        marker_b="Version 2.0" ;;
+          MIT)           marker_a="MIT License";           marker_b="Permission is hereby granted" ;;
+          BSD-3-Clause)  marker_a="Redistribution and use"; marker_b="Neither the name" ;;
+          BSD-2-Clause)  marker_a="Redistribution and use"; marker_b="THIS SOFTWARE IS PROVIDED" ;;
+          GPL-3.0-only|GPL-3.0-or-later)
+                         marker_a="GNU GENERAL PUBLIC LICENSE"; marker_b="Version 3" ;;
+          MPL-2.0)       marker_a="Mozilla Public License"; marker_b="Version 2.0" ;;
+          *)
+            echo "::error::license-present: SPDX id '$SPDX_ID' not recognised." \
+              "fix: add an 'SPDX-License-Identifier: $SPDX_ID' line to" \
+              "'$LICENSE_FILE', or extend the action's known-id table." >&2
+            exit 1
+            ;;
+        esac
+
+        if grep -qF "$marker_a" "$LICENSE_FILE" && grep -qF "$marker_b" "$LICENSE_FILE"; then
+          echo "license-present: '$LICENSE_FILE' matches $SPDX_ID (body markers)."
+          exit 0
+        fi
+
+        echo "::error::license-present: '$LICENSE_FILE' is not $SPDX_ID" \
+          "(expected markers '$marker_a' + '$marker_b', or an" \
+          "'SPDX-License-Identifier: $SPDX_ID' line). fix: replace" \
+          "'$LICENSE_FILE' with the correct $SPDX_ID text." >&2
+        exit 1

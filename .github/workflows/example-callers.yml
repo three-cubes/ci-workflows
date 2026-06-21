@@ -45,6 +45,37 @@ permissions:
   contents: read
 
 jobs:
+  # ── python-quality-gate ───────────────────────────────────────────────────
+  # The converged Python gate. Both shapes pass ONLY environment inputs (the
+  # gate STEPS live in each repo's [tool.tc_fitness] config, not here), so the
+  # call-graph check validates the toolchain/install/coverage/Node-half contract
+  # — the one workflow_call surface not previously exercised by a static caller.
+  quality-kairix:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/python-quality-gate.yml
+    with:
+      # kairix-shaped: single-package install superset, full-history checkout for
+      # the engine's new-code/secret-scan diff, coverage handed to sonar-scan.
+      python-version: "3.12"
+      sync-args: --all-extras --all-groups
+      fetch-depth: 0
+      coverage-artifact-name: coverage-data
+      coverage-xml-path: coverage.xml
+    secrets:
+      gh-token: dummy-token-shape-check-only
+
+  quality-taz:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/python-quality-gate.yml
+    with:
+      # taz-shaped: locked workspace install, the Node/TS half on (taz ships MCP
+      # packages alongside the Python gate), its own coverage artifact name.
+      sync-args: --locked --all-packages
+      run-node: true
+      pnpm-version: 10.27.0
+      coverage-artifact-name: taz-coverage
+      ts-coverage-command: pnpm -r --if-present test:coverage
+
   # ── sonar-scan ────────────────────────────────────────────────────────────
   # Required secret SONAR_TOKEN must be passed for the call shape to resolve;
   # a clearly-dummy literal keeps the file secret-free and the run-for-real gate

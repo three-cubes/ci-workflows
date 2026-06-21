@@ -92,6 +92,26 @@ only the Actions **environment** around that command.
 
 **Secret:** `gh-token` (optional) — `GITHUB_TOKEN` for the engine's secret-scan changed-file diff; falls back to `github.token`.
 
+### `meta-quality-gate.yml`
+
+The self-CI gate for **framework / non-Python** repos — the second org GHA
+shape. Where `python-quality-gate.yml` runs the full fitness catalogue, repos
+with no Python package to gate (this repo, docs repos, action collections) run
+the repo-agnostic hygiene legs instead. Each leg is independently toggleable;
+all caller inputs are env-bound before any shell body (injection-safe).
+
+| Input | Default | Purpose |
+|---|---|---|
+| `run-actionlint` | `true` | run actionlint over the workflows + actions |
+| `run-yamllint` | `true` | run yamllint over `yamllint-paths` |
+| `run-license` | `true` | assert a top-level LICENSE declaring `spdx-id` |
+| `run-branch-naming` | `true` | assert the head branch matches `branch-name-pattern` |
+| `yamllint-paths` | `".github/workflows actions"` | paths yamllint scans |
+| `yamllint-config` | relaxed (line-length + document-start off) | inline yamllint `-d` config |
+| `license-file` | `"LICENSE"` | license file the license leg asserts |
+| `spdx-id` | `"Apache-2.0"` | expected SPDX id |
+| `branch-name-pattern` | `^[a-z][a-z0-9-]*/[a-z0-9][a-z0-9_/-]*$` | org `<user>/<slug>` branch shape (Linear shape is a superset) |
+
 ### `sonar-scan.yml`
 
 SonarCloud scan via **artifact handoff** (not a test re-run). Downloads the
@@ -146,8 +166,10 @@ install via compose. Inputs: `image-name`, `image-tag`, `build-context`,
 
 ### `example-callers.yml`
 
-Static **call-graph self-check** of every reusable above. `workflow_dispatch`
-only; every job gated `if: run-for-real == 'true'` (default `false`). actionlint
+Static **call-graph self-check** of every reusable above (including
+`python-quality-gate.yml`, exercised by a kairix-shaped and a taz-shaped
+caller). `workflow_dispatch` only; every job gated `if: run-for-real == 'true'`
+(default `false`). actionlint
 + the reusable-workflow resolver validate input names / required-input presence
 / types / secret shapes against each `workflow_call` contract at parse time — so
 a caller mismatch fails *here*, not in kairix's or taz's pipeline. The bodies
@@ -168,6 +190,16 @@ hand-chaining the pair (kairix's `arch-fitness-catalogue` hook needs the synced
 venv + `tc_fitness` importable). Inputs: `uv-version`, `python-version`,
 `sync-args`, `ci-requirements`, `pre-commit-config`, `extra-args`. Self-pins
 `setup-uv-cached@v1`.
+
+### `actions/license-present`
+
+Asserts the repo carries a top-level LICENSE file declaring the expected
+license — the WHOLE-REPO provenance gate (distinct from the fitness engine's
+per-source-file `license_present` header check). Matches either an explicit
+`SPDX-License-Identifier: <id>` line or the known body markers for the
+recognised ids (Apache-2.0, MIT, BSD-2/3-Clause, GPL-3.0, MPL-2.0). Inputs:
+`license-file` (default `LICENSE`), `spdx-id` (default `Apache-2.0`). Used by
+`meta-quality-gate.yml`'s license leg.
 
 ## Versioning
 

@@ -1,0 +1,159 @@
+name: meta-quality-gate
+
+# Reusable (workflow_call) self-CI gate for FRAMEWORK / NON-PYTHON three-cubes
+# repos — the second of the two org GHA shapes.
+#
+#   * Python repos run the full fitness catalogue via `python-quality-gate.yml`
+#     (checkout → setup-uv-cached → `uv run tc-fitness run`).
+#   * Repos with no Python package to gate (this ci-workflows repo itself, docs
+#     repos, action/workflow collections) instead run THIS meta gate: the
+#     hygiene checks that apply to any repo — actionlint over the workflows,
+#     yamllint over the YAML, a top-level LICENSE assertion, and branch naming.
+#
+# Every leg is independently toggleable so a consumer runs only what applies.
+# All caller-supplied inputs are env-bound before reaching a shell body
+# (never interpolated into a `run:` string) so a value can't break out of its
+# string context — injection-safe per the org workflow standard.
+#
+# Part of three-cubes/kairix#499 (org CI consolidation).
+
+on:
+  workflow_call:
+    inputs:
+      run-actionlint:
+        description: "Run actionlint over .github/workflows + actions."
+        type: boolean
+        default: true
+      run-yamllint:
+        description: "Run yamllint over the YAML scan paths."
+        type: boolean
+        default: true
+      run-license:
+        description: "Assert a top-level LICENSE file declaring the expected SPDX id."
+        type: boolean
+        default: true
+      run-branch-naming:
+        description: "Assert the head branch matches the org branch-naming shape."
+        type: boolean
+        default: true
+      yamllint-paths:
+        description: >-
+          Space-separated paths yamllint scans. Default covers the workflow +
+          action YAML this repo ships.
+        type: string
+        default: ".github/workflows actions"
+      yamllint-config:
+        description: >-
+          Inline yamllint config (the `-d` argument). Default reuses the org's
+          relaxed base: line-length off (workflow descriptions run long) and
+          document-start off (Actions YAML omits the `---`).
+        type: string
+        default: "{extends: relaxed, rules: {line-length: disable, document-start: disable}}"
+      license-file:
+        description: "Path to the license file the license leg asserts."
+        type: string
+        default: "LICENSE"
+      spdx-id:
+        description: "Expected SPDX license identifier (e.g. Apache-2.0, MIT)."
+        type: string
+        default: "Apache-2.0"
+      branch-name-pattern:
+        description: >-
+          Anchored ERE the head branch must match (egrep). The default accepts
+          the org `<user>/<slug>` shape (a Linear `<user>/<team>-<n>-<slug>`
+          branch is a strict superset, so it matches too). Exempt branches
+          (`main`, `develop`, automation) are skipped before the match.
+        type: string
+        default: "^[a-z][a-z0-9-]*/[a-z0-9][a-z0-9_/-]*$"
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    if: inputs.run-actionlint
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install + run actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+  yamllint:
+    if: inputs.run-yamllint
+    name: yamllint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: yamllint
+        shell: bash
+        # Config + scan paths are env-bound, never interpolated into the body.
+        env:
+          YAMLLINT_CONFIG: ${{ inputs.yamllint-config }}
+          YAMLLINT_PATHS: ${{ inputs.yamllint-paths }}
+        run: |
+          set -euo pipefail
+          pipx install yamllint
+          # shellcheck disable=SC2086
+          # rationale: YAMLLINT_PATHS is a deliberate space-separated path list
+          # (a caller input), so word-splitting it into argv is intended.
+          yamllint -d "$YAMLLINT_CONFIG" $YAMLLINT_PATHS
+
+  license:
+    if: inputs.run-license
+    name: license
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Assert LICENSE present
+        uses: three-cubes/ci-workflows/actions/license-present@v1
+        with:
+          license-file: ${{ inputs.license-file }}
+          spdx-id: ${{ inputs.spdx-id }}
+
+  branch-naming:
+    if: inputs.run-branch-naming
+    name: branch-naming
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assert branch name matches the org shape
+        shell: bash
+        # The branch name + pattern are env-bound; the head-ref is read from the
+        # github context (never trusted into the body unquoted).
+        env:
+          # On pull_request the head ref is github.head_ref; on push it's the
+          # ref_name. Either way it reaches the script only as an env value.
+          BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+          BRANCH_PATTERN: ${{ inputs.branch-name-pattern }}
+        run: |
+          set -euo pipefail
+
+          # Exempt the trunk + automation branches (they never match the
+          # feature-branch shape and must not fail the gate).
+          case "$BRANCH_NAME" in
+            main|develop|HEAD|gh-pages) \
+              echo "branch-naming: '$BRANCH_NAME' is exempt."; exit 0 ;;
+            worktree-agent-*|renovate/*|dependabot/*) \
+              echo "branch-naming: '$BRANCH_NAME' is an exempt automation branch."; exit 0 ;;
+          esac
+
+          if [[ -z "$BRANCH_NAME" ]]; then
+            echo "branch-naming: no head branch in context — skipping." ; exit 0
+          fi
+
+          if echo "$BRANCH_NAME" | grep -Eq "$BRANCH_PATTERN"; then
+            echo "branch-naming: '$BRANCH_NAME' matches the org shape."
+            exit 0
+          fi
+
+          echo "::error::branch-naming: '$BRANCH_NAME' does not match" \
+            "'$BRANCH_PATTERN'. fix: rename to the org '<user>/<slug>' shape" \
+            "(e.g. dan/meta-quality-gate): git branch -m <new-name>." >&2
+          exit 1

@@ -34,6 +34,22 @@ for the consumer-facing `@vN` workflow/action references.
 
 ### Added
 
+- **`meta-quality-gate.yml`** — the reusable self-CI gate for framework /
+  non-Python repos (the second org GHA shape, complementing
+  `python-quality-gate.yml`). Toggleable legs: actionlint, yamllint (relaxed
+  org config), a top-level LICENSE/SPDX assertion, and branch naming. All
+  caller inputs are env-bound before any shell body (injection-safe).
+- **`actions/license-present`** — single-sourced composite asserting a
+  top-level LICENSE file declares the expected SPDX id (whole-repo provenance,
+  distinct from the engine's per-file header check). Drives the meta gate's
+  license leg.
+- **ci-workflows dogfoods its own meta gate** — the self-check `ci.yml` now
+  thin-calls `./.github/workflows/meta-quality-gate.yml` (local-path ref)
+  instead of three inline actionlint/yamllint/license jobs, so the repo runs the
+  gate it ships.
+- **`example-callers.yml` now exercises `python-quality-gate.yml`** via a
+  kairix-shaped and a taz-shaped static caller — closing the only reusable
+  `workflow_call` contract not previously validated by the call-graph self-check.
 - `LICENSE` — Apache-2.0 (was an undeclared `Proprietary` marker on a public
   repo). Matched across `fitness-engine` and `platform-templates`.
 - `CHANGELOG.md` (this file).
