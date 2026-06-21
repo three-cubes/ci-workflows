@@ -1,3 +1,4 @@
+---
 name: ci-workflows self-check
 on:
   push: { branches: [main] }
@@ -15,3 +16,29 @@ jobs:
           set -euo pipefail
           bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
           ./actionlint -color
+
+  yamllint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: yamllint workflows + actions
+        shell: bash
+        run: |
+          set -euo pipefail
+          pipx install yamllint
+          # relaxed base: line-length off (workflow descriptions run long),
+          # document-start off (Actions YAML omits ---).
+          yamllint -d "{extends: relaxed, rules: {line-length: disable, document-start: disable}}" \
+            .github/workflows actions
+
+  license:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Assert Apache-2.0 LICENSE present
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f LICENSE || { echo "::error::LICENSE missing"; exit 1; }
+          grep -q "Apache License" LICENSE || { echo "::error::LICENSE is not Apache-2.0"; exit 1; }
+          grep -q "Version 2.0" LICENSE || { echo "::error::LICENSE is not version 2.0"; exit 1; }
