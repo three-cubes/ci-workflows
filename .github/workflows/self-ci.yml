@@ -1,0 +1,41 @@
+name: self-ci
+
+# platform-templates' own CI — the FIRST consumer of the org meta-quality-gate.
+#
+# This repo holds reusable workflows, composite actions, and Bicep modules but
+# ships no Python package, so it adopts the framework/non-Python gate shape
+# (meta-quality-gate) rather than python-quality-gate. The meta gate runs the
+# repo-agnostic hygiene catalogue over this repo's own surfaces:
+#
+#   * actionlint  — over azure-vm-deploy.yml + every composite action.yml
+#   * yamllint    — over the workflow + action YAML
+#   * az bicep build/lint — over infra/bicep/*.bicep
+#   * license_present     — LICENSE at repo root (Apache-2.0, Three Cubes)
+#   * branch_naming       — <user>/<team>-<slug> on non-default branches
+#
+# The gate's STEPS are owned by the meta-quality-gate reusable, not by this
+# caller, and the reusable discovers these surfaces from the checked-out repo
+# (its own defaults), so this caller passes no inputs. This file owns only the
+# trigger surface around that one call.
+#
+# Note: three-cubes/ci-workflows/.github/workflows/meta-quality-gate.yml@v1 is
+# tagged by the org-CI-convergence workstream; this caller resolves once that
+# tag exists.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  meta-quality-gate:
+    name: Quality gate
+    uses: three-cubes/ci-workflows/.github/workflows/meta-quality-gate.yml@v1
+    with:
+      # Composites live under .github/actions here, not a top-level actions/, so
+      # point yamllint at the real YAML locations (not the ci-workflows default).
+      yamllint-paths: ".github/workflows .github/actions"

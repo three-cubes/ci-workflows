@@ -2,7 +2,11 @@
 
 Three Cubes platform engineering — reusable composite actions, shared workflows, and Bicep modules for cross-repo CI/CD standardisation.
 
+**The one true consumer today is [tc-agent-zone](https://github.com/three-cubes/tc-agent-zone)'s deploy-on-merge pipeline** — it calls `azure-vm-deploy.yml@v1` to snapshot → apply → smoke `vm-openclaw` (and `vm-hermes-poc`) on every merge to `main`. Treat that seam as load-bearing: the workflow's `workflow_call` inputs/secrets/permissions are a stable contract.
+
 **The premise:** every Three Cubes repo that deploys to Azure VMs should be doing it the same way. This repo holds that "same way" as code — composite actions for atoms (snapshot, WIF login, apply via run-command, smoke check), reusable workflows for end-to-end patterns, and Bicep modules for the Azure-side identity setup. Consumer repos call into these instead of re-implementing.
+
+This repo gates itself with the org `meta-quality-gate` reusable (`.github/workflows/self-ci.yml`) — the framework/non-Python gate shape: actionlint + yamllint over the workflows and composite actions, `az bicep build` over the Bicep, plus `license_present` and `branch_naming`.
 
 ## What's here
 
