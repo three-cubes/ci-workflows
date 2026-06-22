@@ -90,7 +90,7 @@ gh workflow run "4 · Deploy on merge to main" \
 
 # 4. After green: re-test with skip_snapshot=false to verify snapshot path.
 
-# 5. Done. Future deploy-pattern improvements ship as platform-templates
+# 5. Done. Future deploy-pattern improvements ship as tc-pipelines
 #    bumps; tc-agent-zone consumes them automatically.
 ```
 
@@ -163,7 +163,7 @@ If the migration introduces a bug:
 
 ```bash
 # Revert the workflow file in the consumer repo. The shared workflow is
-# pinned to @v1 — even if the platform-templates repo has a regression,
+# pinned to @v1 — even if the tc-pipelines repo has a regression,
 # pinning to a previous SHA gets you out:
 uses: three-cubes/tc-pipelines/.github/workflows/azure-vm-deploy.yml@<known-good-sha>
 ```
