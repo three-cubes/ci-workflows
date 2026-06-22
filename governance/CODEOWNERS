@@ -1,0 +1,20 @@
+# CODEOWNERS — Golden Path HITL review routing (template).
+#
+# Combined with the `main` ruleset (governance/rulesets/main.json), which sets
+# require_code_owner_review + 1 required approval + thread resolution, this is
+# the human-in-the-loop gate: agents (acting as their own GitHub App identities)
+# can open and prepare PRs, but a human owner must approve before merge. Agent
+# apps are deliberately NOT repo admins, so they cannot bypass these rules.
+#
+# Replace @OWNER with your repo's owning team (e.g. @three-cubes/maintainers) or
+# user before committing. Keep the gate-critical paths owner-only — they must
+# never be self-approved by an agent.
+
+# Default owner — every change requires the owner's review.
+*                            @OWNER
+
+# Gate-critical: CI, automation, and the rules themselves. An agent must never
+# be able to weaken the gates that enforce HITL.
+/.github/                    @OWNER
+/CODEOWNERS                  @OWNER
+/.github/CODEOWNERS          @OWNER
