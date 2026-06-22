@@ -1,5 +1,10 @@
 # governance/ — Golden Path repo-governance templates
 
+> 🛑 **Start at [`STANDARDS.md`](STANDARDS.md)** — the canonical index of the org's build/release/governance
+> intent (the Build & Release Health OKRs, the kairix#499 fitness spec, the canonical homes, the merge model).
+> **Do not re-derive any of it; converge up and promote improvements into the canonical homes.**
+
+
 The canonical baseline a new Three Cubes repo adopts so its branch protection,
 review routing, dependency policy, and local gate all match the Golden Path —
 without hand-copying drift. Consumed by
