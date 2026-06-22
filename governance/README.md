@@ -8,8 +8,8 @@ without hand-copying drift. Consumed by
 
 | File | What it sets | How it's applied |
 |---|---|---|
-| [`rulesets/main.json`](rulesets/main.json) | The `main` branch ruleset: block deletion + force-push; PR required (1 approval, code-owner review, stale-dismiss, thread resolution, merge-only); required checks **Quality gate** + **SonarCloud scan** + **SonarCloud Code Analysis** (strict). | `gh api repos/<repo>/rulesets --method POST` |
-| [`CODEOWNERS`](CODEOWNERS) | HITL review routing — default owner + gate-critical paths owner-only. **Replace `@OWNER`.** | committed to the target repo's `.github/CODEOWNERS` |
+| [`rulesets/main.json`](rulesets/main.json) | The `main` branch ruleset: block deletion + force-push; PR required with **0 approvals (autonomous work)** + **code-owner review** (HITL on control-plane paths only); **not strict** (no forced up-to-date rebase) and **no stale-dismiss** — to stop the rebaseline → re-run → re-review churn; required checks **Quality gate** + **SonarCloud scan** + **SonarCloud Code Analysis**. | `gh api repos/<repo>/rulesets --method POST` |
+| [`CODEOWNERS`](CODEOWNERS) | **Two-tier** review routing — only the control plane (the gate's own definition) is owned, so work merges autonomously on a green gate while gate-defining changes need a human. **No `* @OWNER`. Replace `@OWNER`** with your human team. | committed to the target repo's `.github/CODEOWNERS` |
 | [`dependabot.yml`](dependabot.yml) | 3-day-cooldown dependency policy (pip + npm + github-actions), grouped, security-toggle-OFF. | committed to `.github/dependabot.yml` |
 | [`pre-commit-config.yaml`](pre-commit-config.yaml) | The cheap local gate (hygiene + detect-secrets + actionlint + shellcheck + ruff + bandit) before the CI round-trip. | committed to `.pre-commit-config.yaml` |
 
