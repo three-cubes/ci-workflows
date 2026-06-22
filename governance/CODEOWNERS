@@ -1,20 +1,45 @@
-# CODEOWNERS — Golden Path HITL review routing (template).
+# CODEOWNERS — Golden Path TWO-TIER review routing (template).
 #
-# Combined with the `main` ruleset (governance/rulesets/main.json), which sets
-# require_code_owner_review + 1 required approval + thread resolution, this is
-# the human-in-the-loop gate: agents (acting as their own GitHub App identities)
-# can open and prepare PRs, but a human owner must approve before merge. Agent
-# apps are deliberately NOT repo admins, so they cannot bypass these rules.
+# Model: AUTONOMOUS work, HITL control plane.
+#   - WORK changes (code, data, docs) are AUTONOMOUS. With
+#     required_approving_review_count = 0 in governance/rulesets/main.json, a PR
+#     that touches NO owned path below merges on a GREEN gate with no human. The
+#     gate is the control — so invest in it (coverage + mutation + fitness + Sonar)
+#     and keep it deterministic. "Green" must be trustworthy because nothing else
+#     gates work.
+#   - CONTROL-PLANE changes — the gate's OWN definition — are HITL. With
+#     require_code_owner_review = true, a PR touching an owned path needs a human
+#     maintainer's approval. This is what keeps "green" honest: an agent must never
+#     be able to weaken the gate that gates it.
 #
-# Replace @OWNER with your repo's owning team (e.g. @three-cubes/maintainers) or
-# user before committing. Keep the gate-critical paths owner-only — they must
-# never be self-approved by an agent.
+# Replace @OWNER with the repo's HUMAN owning team (e.g. @three-cubes/maintainers).
+# Agent App identities are deliberately NOT members and NOT repo admins, so they
+# can neither self-approve a control-plane change nor bypass the rules.
+#
+# NOTE: there is deliberately NO `* @OWNER` line — a default owner would force
+# review on EVERY PR (the admin-merge-spam failure mode). Own only the control
+# plane. Repos extend this with their own gate-defining paths (e.g. schemas).
 
-# Default owner — every change requires the owner's review.
-*                            @OWNER
-
-# Gate-critical: CI, automation, and the rules themselves. An agent must never
-# be able to weaken the gates that enforce HITL.
+# ── CI / CD / automation (defines how things build, test, and merge) ─────────
 /.github/                    @OWNER
 /CODEOWNERS                  @OWNER
 /.github/CODEOWNERS          @OWNER
+
+# ── The gate's definition (what "green" means) ───────────────────────────────
+/pyproject.toml              @OWNER   # [tool.tc_fitness] gate config + dependency pins
+/.tc-fitness.toml            @OWNER
+/uv.lock                     @OWNER
+/scripts/                    @OWNER   # validators / generators the gate runs
+/sonar-project.properties    @OWNER
+/.pre-commit-config.yaml     @OWNER
+/renovate.json               @OWNER
+/.github/dependabot.yml      @OWNER
+/.gitattributes              @OWNER
+# Schemas define "valid" → repos that carry them own them here, e.g.:
+#   /core/schemas/             @OWNER
+
+# ── Security / governance / provenance ───────────────────────────────────────
+/SECURITY.md                 @OWNER
+/.secrets.baseline           @OWNER
+/LICENSE                     @OWNER
+/docs/adr/                   @OWNER
