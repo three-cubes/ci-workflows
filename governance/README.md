@@ -23,3 +23,7 @@ repo enforces the same gate. The fitness gate itself lives in
 [tc-fitness](https://github.com/three-cubes/tc-fitness); the reusable CI that
 produces the required `Quality gate` / `SonarCloud scan` checks lives here in
 [tc-pipelines](../README.md).
+
+The bar those checks must meet for a repo to run **autonomously** (0 approvals on work) is
+the [**Gate-Hardening Standard**](gate-hardening.md) — harden a repo's gate to it and verify
+it runs green *and deterministic* **before** flipping that repo to 0-review.
