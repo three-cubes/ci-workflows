@@ -5,7 +5,7 @@ name: meta-quality-gate
 #
 #   * Python repos run the full fitness catalogue via `python-quality-gate.yml`
 #     (checkout → setup-uv-cached → `uv run tc-fitness run`).
-#   * Repos with no Python package to gate (this ci-workflows repo itself, docs
+#   * Repos with no Python package to gate (this tc-pipelines repo itself, docs
 #     repos, action/workflow collections) instead run THIS meta gate: the
 #     hygiene checks that apply to any repo — actionlint over the workflows,
 #     yamllint over the YAML, a top-level LICENSE assertion, and branch naming.
@@ -116,7 +116,7 @@ jobs:
         shell: bash
         # Inlined (not the license-present composite) so the gate has NO
         # dependency on an action ref that only resolves post-merge — this works
-        # for the ci-workflows self-CI bootstrap AND for foreign consumers of
+        # for the tc-pipelines self-CI bootstrap AND for foreign consumers of
         # meta-quality-gate@v1. The file path + SPDX id are env-bound (never
         # interpolated into the body) — injection-safe per the org standard.
         env:

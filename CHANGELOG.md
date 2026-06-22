@@ -56,6 +56,24 @@ for the consumer-facing `@vN` workflow/action references.
 - Self-CI: `yamllint` over the workflows/actions and a LICENSE-presence
   assertion, alongside the existing `actionlint` pass.
 
+## [1.3.0] — 2026-06-22
+
+### Changed
+
+- **Renamed `ci-workflows` → `tc-pipelines`** and **merged in `platform-templates`**
+  (history-preserving) — one repo under the Three Cubes Golden Path for both the
+  CI/quality reusables and the Azure-VM deploy reusables. Consumers pin
+  `tc-pipelines@v1` (the `v1` floating major moved to the merged HEAD).
+
+### Added
+
+- Azure-VM deploy surfaces from the former `platform-templates`:
+  `azure-vm-deploy.yml`, the `wif-azure-login` / `snapshot-azure-vm-disk` /
+  `apply-on-vm-via-runcommand` / `smoke-systemctl` composites, and
+  `infra/bicep/ci-deploy-identity.bicep`. Internal `uses:` refs are
+  self-contained within `tc-pipelines` (no cross-repo reach into the archived
+  `platform-templates`).
+
 ## [1.0.0] — 2026-06-14
 
 First tagged baseline of the org-shared CI surface (kairix#499 Phase 4).

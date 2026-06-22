@@ -7,7 +7,7 @@ name: example-callers (reusable self-check)
 # names, required-input presence, types, and secret shapes against the reusable's
 # `workflow_call:` contract at parse time — so an input a consumer would pass that
 # the reusable doesn't accept (or a required input a consumer omits) fails HERE,
-# in ci-workflows' own CI, rather than later in kairix's or taz's pipeline.
+# in tc-pipelines' own CI, rather than later in kairix's or taz's pipeline.
 #
 # This workflow NEVER runs the underlying work by default:
 #   * `workflow_dispatch` only — never on push/PR, so it can't fire on a merge.
