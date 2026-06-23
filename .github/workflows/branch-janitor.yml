@@ -1,0 +1,98 @@
+name: branch-janitor
+
+# Org-wide stale-branch cleanup, so branch hygiene is zero-toil.
+#
+# `delete_branch_on_merge` (on in every repo) already deletes a PR's head branch
+# when it is MERGED via the PR. This sweep closes the remaining gap:
+#   - branches whose PR was CLOSED (not merged) — auto-delete never fires on close;
+#   - branches merged outside the PR button.
+#
+# Provably safe: it deletes a branch ONLY if its latest PR is MERGED or CLOSED.
+# It NEVER deletes the default branch, a protected branch, a branch with an OPEN
+# PR, or a branch with NO PR (an orphan — those are reported for a human, not
+# deleted). Runs as the three-cubes-agent App (secret-free via WIF + Key Vault),
+# which is the only identity with cross-repo access from a single workflow.
+#
+# Standard: governance/STANDARDS.md §4 (merge governance).
+
+on:
+  schedule:
+    - cron: "0 17 * * 1" # Mondays 17:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "List what would be deleted without deleting"
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write # WIF, to mint the App token
+  contents: read
+
+concurrency:
+  group: branch-janitor
+  cancel-in-progress: false
+
+jobs:
+  janitor:
+    runs-on: ubuntu-latest
+    steps:
+      - id: app
+        uses: three-cubes/tc-pipelines/.github/actions/github-app-token@v1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Prune merged/closed-PR branches across the installation
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          deleted=0
+          orphans=()
+
+          # Repos the agent App is installed on (the correct scope for an installation token).
+          mapfile -t repos < <(gh api --paginate /installation/repositories \
+            --jq '.repositories[].full_name')
+          echo "Scanning ${#repos[@]} repo(s). DRY_RUN=$DRY_RUN"
+
+          for slug in "${repos[@]}"; do
+            default=$(gh api "repos/$slug" --jq '.default_branch')
+            while read -r branch; do
+              [ -z "$branch" ] && continue
+              [ "$branch" = "$default" ] && continue
+              state=$(gh pr list --repo "$slug" --head "$branch" --state all \
+                --json state --jq '.[0].state // ""' 2>/dev/null || echo "")
+              case "$state" in
+                MERGED|CLOSED)
+                  if [ "$DRY_RUN" = "true" ]; then
+                    echo "would delete: $slug @ $branch  (latest PR $state)"
+                  else
+                    if gh api -X DELETE "repos/$slug/git/refs/heads/$branch" >/dev/null 2>&1; then
+                      echo "deleted: $slug @ $branch  (latest PR $state)"
+                      deleted=$((deleted + 1))
+                    else
+                      echo "skip (delete failed): $slug @ $branch"
+                    fi
+                  fi
+                  ;;
+                "")
+                  orphans+=("$slug @ $branch")
+                  ;;
+                *) ;; # OPEN — keep
+              esac
+            done < <(gh api --paginate "repos/$slug/branches" \
+              --jq '.[] | select(.protected == false) | .name')
+          done
+
+          echo "----"
+          echo "branches deleted: $deleted"
+          if [ "${#orphans[@]}" -gt 0 ]; then
+            echo "orphan branches (NO PR — left for a human to triage, never auto-deleted):"
+            printf '  %s\n' "${orphans[@]}"
+          else
+            echo "orphan branches: none"
+          fi
