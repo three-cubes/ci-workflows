@@ -49,6 +49,9 @@ jobs:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          # Scope the token to ALL org repos (the action defaults to the current
+          # repo only) so the janitor can sweep branches org-wide.
+          owner: three-cubes
 
       - name: Prune merged/closed-PR branches across the installation
         env:
