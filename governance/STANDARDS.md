@@ -46,7 +46,29 @@ Agents author PRs as a **dedicated GitHub App** (`three-cubes-agent`), never a h
 
 This model is **safe only because the gate is hard + fast** (§1–§2). Harden + verify a repo's gate before flipping it to autonomous.
 
-## 5. For agents (the anti-reinvention rule)
+## 5. The inner-loop contract — replay the gate before you push
+
+The merge model (§4) is safe **only if green-locally implies green-in-CI.** Every `main`-break this
+org has had traces to a violation of one of these three rules:
+
+1. **Replay the *exact* CI gate locally before every push.** With the full dev env installed
+   (`uv sync --all-extras --all-groups`), run what CI runs — `uv run pre-commit run --all-files`
+   **and** `uv run tc-fitness run` — and get it green. A bare `python3` / `ruff` / single-file run is
+   **not** a replay: it silently skips import-dependent fitness rules (they need the engine installed)
+   and only checks the files you name, while CI runs `--all-files`. If it is green locally but red in
+   CI, that is an **O1 parity bug in the local loop** (§1, O1) — fix the loop; never paper over it.
+
+2. **Regenerate-and-stage generated artifacts.** When you touch an *input* to a generated file,
+   regenerate it and stage it in the **same** commit. A stale generated artifact reds `main` even when
+   your hand-edit was correct. Known input→artifact pairs: `.github/CODEOWNERS` →
+   `public-interface-inventory.yaml`; catalogue inputs → the catalogue-currency check. (Wave-1's
+   "regenerate-and-stage" — until a pre-push hook enforces it, it is on you.)
+
+3. **Never merge over a red gate.** No admin bypass, no "I'll fix it after." A red gate means the
+   change is not done. The autonomous rulesets enforce this (zero bypass actors); **humans must hold
+   the same line** — admin-merging red work is what breaks `main` and forces self-heal churn.
+
+## 6. For agents (the anti-reinvention rule)
 
 Before you design a quality gate, a fitness function, a coverage/mutation policy, a CI workflow, or a
 governance rule: **it already exists above.** Read it. If it's missing or weak, **propose the change
