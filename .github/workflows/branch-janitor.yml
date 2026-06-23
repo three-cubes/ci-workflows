@@ -37,8 +37,14 @@ jobs:
   janitor:
     runs-on: ubuntu-latest
     steps:
+      # Checkout so the same-repo composite action resolves via a local ./ ref.
+      # (A same-repo `uses:` needs the repo present; the `@v1` tag predates this action.)
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
       - id: app
-        uses: three-cubes/tc-pipelines/.github/actions/github-app-token@v1
+        uses: ./.github/actions/github-app-token
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
