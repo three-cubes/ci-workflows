@@ -166,7 +166,16 @@ Agents act as a dedicated **GitHub App** (`three-cubes-agent`), not a person's a
 
 | Surface | Purpose |
 |---|---|
-| [`.github/actions/github-app-token`](.github/actions/github-app-token/action.yml) | WIF → read the agent App creds from Key Vault → mint a short-lived installation token. Outputs `token` (+ `app-slug`, `installation-id`). |
+| [`.github/actions/github-app-token`](.github/actions/github-app-token/action.yml) | **CI:** WIF → read the agent App creds from Key Vault → mint a short-lived installation token. Outputs `token` (+ `app-slug`, `installation-id`). |
+| [`tools/`](tools/) (`agent-token`) | **Off-CI / local / MCP agents:** installable console tool that mints the same App token from Key Vault via `az`. Imported by pinned `uvx`, not vendored per repo. |
+
+```bash
+# off-CI (local / MCP agent), so an agent raises PRs as the App, never a human:
+export GH_TOKEN="$(uvx --from 'git+https://github.com/three-cubes/tc-pipelines@v1#subdirectory=tools' agent-token)"
+git config user.name 'three-cubes-agent[bot]'
+git config user.email '295831460+three-cubes-agent[bot]@users.noreply.github.com'
+# now git push / gh pr create act as the App
+```
 
 ```yaml
 # in a consumer repo workflow — authenticate git/gh as the agent App:
