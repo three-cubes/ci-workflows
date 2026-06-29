@@ -65,6 +65,17 @@ on:
         description: Subscription ID (typically vars.AZURE_SUBSCRIPTION_ID).
         required: true
         type: string
+      surface-apply-output:
+        description: |
+          Set to "true" to expose the concatenated apply-script output (all
+          targets) as the job output `apply-output`, so a caller can read a
+          value the apply script printed (e.g. a benchmark/eval marker) in a
+          downstream job. Off by default — apply output is not surfaced unless
+          a consumer opts in. Apply scripts must not print secrets when enabled
+          (job outputs are not log-masked).
+        required: false
+        type: string
+        default: 'false'
 
 permissions:
   contents: read
@@ -74,6 +85,11 @@ jobs:
   deploy:
     name: WIF → snapshot → apply → smoke
     runs-on: ubuntu-latest
+    outputs:
+      # Concatenated apply-script output across all targets. Empty unless the
+      # caller sets `surface-apply-output: 'true'`. Lets a downstream caller job
+      # read a value the apply script printed (e.g. a benchmark marker).
+      apply-output: ${{ steps.apply.outputs.apply-output }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
@@ -104,12 +120,17 @@ jobs:
           skip: ${{ inputs.skip-snapshot }}
 
       - name: Apply on each target + smoke
+        id: apply
         shell: bash
         env:
           TARGETS_YAML: ${{ inputs.targets }}
           RG: ${{ inputs.resource-group }}
+          SURFACE_OUTPUT: ${{ inputs.surface-apply-output }}
         run: |
           set -euo pipefail
+          # Accumulate each target's apply output so it can optionally be
+          # surfaced as the `apply-output` job output (see surface-apply-output).
+          APPLY_ACC="$(mktemp)"
           # az vm run-command is serialised per-VM by Azure — invocations
           # collide with a (Conflict) error when a prior extension run is
           # still in flight (operator ad-hoc commands, prior deploy that
@@ -157,6 +178,7 @@ jobs:
             echo "----- BEGIN ${VM} apply output -----"
             echo "$MSG"
             echo "----- END ${VM} apply output -----"
+            printf '=== %s ===\n%s\n' "$VM" "$MSG" >> "$APPLY_ACC"
             if echo "$MSG" | grep -qE '(^FAIL |^✗ |^ERROR:|Permission denied|fatal: |command not found)'; then
               echo "::error::Apply on ${VM} reported failure (see output above)."
               exit 1
@@ -194,3 +216,15 @@ jobs:
               fi
             fi
           done
+          # Opt-in: expose the concatenated apply output as the `apply-output`
+          # job output so a caller can read a value the apply script printed.
+          # Off by default (no output, current behaviour). Multiline value via a
+          # randomised heredoc delimiter that cannot collide with apply text.
+          if [[ "${SURFACE_OUTPUT:-false}" == "true" ]]; then
+            DELIM="KX_APPLY_OUTPUT_$RANDOM$RANDOM"
+            {
+              echo "apply-output<<${DELIM}"
+              cat "$APPLY_ACC"
+              echo "${DELIM}"
+            } >> "$GITHUB_OUTPUT"
+          fi
