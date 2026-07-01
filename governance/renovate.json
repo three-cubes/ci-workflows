@@ -1,0 +1,41 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "Golden Path Renovate baseline (template).",
+    "Covers the one dependency governance/dependabot.yml cannot: the three-cubes-fitness gate engine, pinned by git tag in pyproject.toml (git+https://github.com/three-cubes/tc-fitness.git@vX.Y.Z). Dependabot's uv ecosystem cannot track a git-URL dep; the customManagers regex manager + github-tags datasource below can.",
+    "minimumReleaseAge holds the same uniform 3-day cooldown as governance/dependabot.yml (internalChecksFilter=strict makes it a hard hold, not just a pending flag) so an engine tag must age 3 days before a bump PR opens — letting the community surface a compromised release first.",
+    "Engine bumps are gate-critical: never automerged, labelled ci-engine, and human-reviewed (they change the definition of the quality gate itself). Copy this file to the repo root as renovate.json; a repo that keeps Dependabot for its registry ecosystems can trim to just the customManagers + packageRules blocks."
+  ],
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits"
+  ],
+  "labels": ["dependencies", "build-release-health"],
+  "minimumReleaseAge": "3 days",
+  "internalChecksFilter": "strict",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on monday"]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Bump the three-cubes-fitness engine, pinned by git tag in pyproject.toml. Dependabot's uv ecosystem cannot track git-URL deps; this regex manager + github-tags datasource can.",
+      "managerFilePatterns": ["/(^|/)pyproject\\.toml$/"],
+      "matchStrings": [
+        "git\\+https://github\\.com/three-cubes/tc-fitness\\.git@(?<currentValue>v[0-9]+\\.[0-9]+\\.[0-9]+)"
+      ],
+      "depNameTemplate": "three-cubes/tc-fitness",
+      "datasourceTemplate": "github-tags"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Engine bumps are gate-critical — never automerge; surface for review.",
+      "matchDepNames": ["three-cubes/tc-fitness"],
+      "automerge": false,
+      "addLabels": ["ci-engine"]
+    }
+  ]
+}
