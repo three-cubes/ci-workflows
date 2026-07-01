@@ -1,0 +1,116 @@
+name: sonar-triage
+
+# Reusable (workflow_call) SonarCloud security-hotspot triage for three-cubes
+# repos — promoted into CORE from kairix's per-repo scripts/sonar. The shared
+# surface is ONLY the Bearer-token transport + the list->resolve->acknowledge
+# driver loop; the triage DECISIONS (which (rule, file) pairs are accepted, and
+# why) stay REPO-OWNED in a rationale JSON file the caller passes by path.
+#
+# Why this exists: SonarCloud's hotspot review is a UI-only flow by default —
+# there is no in-code suppression that changes hotspot status. Triaging hotspots
+# through the web UI is tedious and its audit trail is hand-typed. This driver
+# marks each hotspot whose location matches a REPO-OWNED rationale as
+# REVIEWED/SAFE with that rationale recorded in Sonar's audit trail, so the
+# decision is reviewed in the owning repo's git history. Hotspots with no
+# rationale are left untouched (and the run exits non-zero) so they stay visible.
+#
+# SCHEDULED CADENCE: a reusable workflow can't self-schedule in a consumer repo
+# (`on: schedule` only fires from the repo that owns the file). Wire the weekly
+# cadence in the CALLER with a thin `on: schedule` workflow that `uses:` this one
+# — recommended cron `0 8 * * 1` (Mondays 08:00 UTC), plus workflow_dispatch for
+# on-demand runs. The full caller snippet + rationale is in
+# docs/SONAR-MAINTENANCE.md. Running weekly stops hotspots accruing silently.
+#
+# All caller inputs are env-bound before reaching a shell body (never
+# interpolated into a `run:` string) so a value can't break out of its context.
+#
+# Part of the Autonomous Delivery Platform roadmap — Supply-Chain & Dependabot
+# Remediation (SGO-191, folds SGO-101's triage-cadence limb).
+
+on:
+  workflow_call:
+    inputs:
+      project-key:
+        description: >-
+          SonarCloud project key to triage (e.g. three-cubes_kairix). Required.
+        type: string
+        required: true
+      rationales-path:
+        description: >-
+          Path (in the CALLER's repo) to the repo-owned rationale JSON file — a
+          list of {rule, path, line?, rationale} entries. Only hotspots whose
+          location matches an entry are acknowledged.
+        type: string
+        default: ".sonar/hotspot-rationales.json"
+      sonar-base:
+        description: "SonarQube/SonarCloud base URL."
+        type: string
+        default: "https://sonarcloud.io"
+      fetch-depth:
+        description: >-
+          Caller-repo checkout depth. 1 (default) is enough — only the rationale
+          file is read, not git history.
+        type: number
+        default: 1
+      driver-ref:
+        description: >-
+          tc-pipelines ref the triage driver (tools/sonar/triage_hotspots.py) is
+          checked out from. Pin this to the SAME ref you pin this workflow at
+          (e.g. v1) so the driver version matches the workflow version.
+        type: string
+        default: "v1"
+    secrets:
+      SONAR_TOKEN:
+        description: >-
+          SonarCloud token with permission to change hotspot status on the
+          project. Required — the triage cannot authenticate without it.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  triage:
+    name: Mark hotspots Reviewed/SAFE with rationale
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # The caller's repo carries the REPO-OWNED rationale file, so it is checked
+      # out into the workspace root.
+      - name: Checkout caller repo (rationale file)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: ${{ inputs.fetch-depth }}
+          persist-credentials: false
+
+      # The CORE driver is fetched from tc-pipelines at the pinned ref, into a
+      # dot-prefixed helper dir so it never collides with the caller's tree.
+      - name: Checkout CORE sonar driver
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: three-cubes/tc-pipelines
+          ref: ${{ inputs.driver-ref }}
+          path: .tc-pipelines
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Triage SonarCloud hotspots
+        shell: bash
+        # Caller inputs are env-bound, never interpolated into the body — a value
+        # can't break out of its string context (injection-safe per org standard).
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          PROJECT_KEY: ${{ inputs.project-key }}
+          RATIONALES_PATH: ${{ inputs.rationales-path }}
+          SONAR_BASE: ${{ inputs.sonar-base }}
+        run: |
+          set -euo pipefail
+          python3 .tc-pipelines/tools/sonar/triage_hotspots.py \
+            --project-key "$PROJECT_KEY" \
+            --rationales "$RATIONALES_PATH" \
+            --sonar-base "$SONAR_BASE"

@@ -1,0 +1,107 @@
+name: sonar-new-code-reset
+
+# Reusable (workflow_call) SonarCloud "New Code" baseline reset for three-cubes
+# repos — promoted into CORE from kairix's per-repo scripts/sonar so every repo
+# shares ONE reviewed transport + read->set->read driver instead of forking it.
+#
+# What it does: resets a project/branch's New Code period to a chosen type
+# (default PREVIOUS_VERSION). The New Code window drifts over time so pre-existing
+# code gets counted as "new", failing the server-side Quality Gate on accumulated
+# debt and flipping the whole scan run to failure. Setting "Previous version" is a
+# Web-API-or-UI-only operation (NOT a scanner property), so the driver drives the
+# API directly with the admin-scoped SONAR_TOKEN. Once reset, the scan's
+# `sonar.projectVersion` (emitted per release) rolls the window forward with no
+# further manual resets.
+#
+# This is a deliberate, shared-infra action — callers wire it behind a MANUAL
+# workflow_dispatch (see the example caller in docs/SONAR-MAINTENANCE.md), never
+# on push. The driver is idempotent: it prints the New Code period before and
+# after the set, so a re-run on an already-reset project is a no-op observation.
+#
+# Repo-specific values (project key, branch, New Code type, server URL) are
+# inputs, never module constants — the same driver resets any project. All
+# caller inputs are env-bound before reaching a shell body (never interpolated
+# into a `run:` string) so a value can't break out of its string context.
+#
+# Part of the Autonomous Delivery Platform roadmap — Supply-Chain & Dependabot
+# Remediation (SGO-191, folds SGO-101's triage-cadence limb).
+
+on:
+  workflow_call:
+    inputs:
+      project-key:
+        description: >-
+          SonarCloud project key to reset (e.g. three-cubes_kairix). Required —
+          no default, so a caller can never silently reset the wrong project.
+        type: string
+        required: true
+      branch:
+        description: "Branch whose New Code period is reset."
+        type: string
+        default: "main"
+      new-code-type:
+        description: >-
+          New Code period type to set: PREVIOUS_VERSION (default) |
+          NUMBER_OF_DAYS | SPECIFIC_ANALYSIS | REFERENCE_BRANCH.
+        type: string
+        default: "PREVIOUS_VERSION"
+      sonar-base:
+        description: "SonarQube/SonarCloud base URL."
+        type: string
+        default: "https://sonarcloud.io"
+      driver-ref:
+        description: >-
+          tc-pipelines ref the reset driver (tools/sonar/reset_new_code.py) is
+          checked out from. Pin this to the SAME ref you pin this workflow at
+          (e.g. v1) so the driver version matches the workflow version.
+        type: string
+        default: "v1"
+    secrets:
+      SONAR_TOKEN:
+        description: >-
+          SonarCloud token with Administer permission on the project. Required —
+          the New Code period cannot be set without it.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  reset-new-code:
+    name: Reset New Code period
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Fetch the CORE driver from tc-pipelines at the pinned ref. The reset is
+      # a pure API call, so the caller's own repo is never checked out here.
+      - name: Checkout CORE sonar driver
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: three-cubes/tc-pipelines
+          ref: ${{ inputs.driver-ref }}
+          path: .tc-pipelines
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Reset SonarCloud New Code baseline
+        shell: bash
+        # Caller inputs are env-bound, never interpolated into the body — a value
+        # can't break out of its string context (injection-safe per org standard).
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          PROJECT_KEY: ${{ inputs.project-key }}
+          BRANCH: ${{ inputs.branch }}
+          NEW_CODE_TYPE: ${{ inputs.new-code-type }}
+          SONAR_BASE: ${{ inputs.sonar-base }}
+        run: |
+          set -euo pipefail
+          python3 .tc-pipelines/tools/sonar/reset_new_code.py \
+            --project-key "$PROJECT_KEY" \
+            --branch "$BRANCH" \
+            --new-code-type "$NEW_CODE_TYPE" \
+            --sonar-base "$SONAR_BASE"
