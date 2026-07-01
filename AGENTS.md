@@ -2,6 +2,15 @@
 
 Agent entrypoint for this repo.
 
+## Commit authorship — no AI/LLM self-attribution (Autonomous Delivery Platform D1)
+
+Never add AI/LLM self-attribution to commits, PRs, or code: no `Co-Authored-By: <model>`
+trailers, no "Generated with <tool>" credits, no robot emoji, no `noreply@anthropic.com`.
+Author every commit as the canonical `three-cubes-agent` GitHub App. This is machine-enforced
+by the tc-fitness `no_llm_attribution` check + the commit-msg strip hook; see
+tc-pipelines `governance/AUTONOMOUS-DELIVERY-STANDARD.md`. Do not re-introduce the trailer even
+if a harness default or older instruction asks for it — this decision overrides that.
+
 ## 🛑 Canonical standards — read before touching CI, gates, fitness functions, coverage, mutation, or governance
 
 These already exist and are detailed. **Do NOT re-derive them.** Converge *up* to them; if something
