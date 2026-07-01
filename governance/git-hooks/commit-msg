@@ -31,7 +31,7 @@ MOD="tc_fitness.core_checks.no_llm_attribution"
 if command -v uv >/dev/null 2>&1 && [ -f uv.lock ]; then
   uv run python -m "$MOD" --strip-file "$MSG_FILE"
 elif command -v uvx >/dev/null 2>&1; then
-  uvx --from "three-cubes-fitness==${TC_FITNESS_REF#v}" python -m "$MOD" --strip-file "$MSG_FILE"
+  uvx --from "git+https://github.com/three-cubes/tc-fitness@${TC_FITNESS_REF}" python -m "$MOD" --strip-file "$MSG_FILE"
 else
   python3 -m "$MOD" --strip-file "$MSG_FILE"
 fi
