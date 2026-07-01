@@ -1,0 +1,409 @@
+name: 'Reusable — Capability health probe (post-deploy live-connector runtime + measurement)'
+
+# Three Cubes shared POST-DEPLOY capability-health workflow.
+#
+# Proves each CONFIGURED agent capability is actually reachable on a live host —
+# closing the "validate passing != runtime working" blind spot (SGO-126). It runs
+# the SAME probe the repo's local `verify-capability` runtime tier runs, so the
+# deploy gate and the local loop agree by construction.
+#
+# The capability ladder is static -> runtime -> measurement:
+#   * static       the rule-layer gates (latency-budget, timeout-coherence, …) run
+#                  PR-side in the consumer's CI and BLOCK merges. They are NOT here.
+#   * runtime      THIS workflow: the live-connector probe on the deployed host,
+#                  reading the LIVE gateway config (never a repo heuristic), spawning
+#                  the configured connectors end-to-end. Post-deploy + nightly.
+#   * measurement  THIS workflow: it publishes a machine-readable result artifact
+#                  (reachable / unreachable per capability + warm latency) the ops
+#                  dashboard ingests.
+#
+# ALERT-tier, never PR-blocking. This is designed to be called post-deploy and on a
+# nightly schedule — it must NOT be wired as a branch-protection required context and
+# must NOT run on `pull_request`. A newly-unreachable capability alerts (via the
+# optional ALERT_WEBHOOK secret and/or the probe's own VM-side alerting) and, by
+# default, reds the run as a SECONDARY signal; it gates no merge.
+#
+# The pure probe logic stays in the CONSUMER repo (the probe command it passes),
+# because the live config, connectors, and gateway env are repo/host specific.
+# CORE lifts only the WORKFLOW CONTRACT: WIF login -> run the probe on the VM ->
+# parse the verdict -> publish the measurement artifact -> alert / gate on breach.
+#
+# Consumers call this from their own nightly + post-deploy workflow with:
+#
+#   jobs:
+#     capability-health:
+#       uses: three-cubes/tc-pipelines/.github/workflows/capability-health-probe.yml@v1
+#       with:
+#         resource-group: RG-AGENTS-CORE
+#         vm-name: vm-openclaw
+#         # The probe command is run ON the VM. Keep the pure logic in your repo;
+#         # it must self-source the gateway env and read the LIVE config.
+#         probe-command: bash /opt/tc-agent-zone/current/agentops/apply/run-nightly-capability-probe.sh
+#         run-as-user: openclaw
+#         deep: ${{ github.event.inputs.deep || 'true' }}
+#         azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
+#         azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
+#         azure-subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+#       permissions:
+#         contents: read
+#         id-token: write
+#       secrets:
+#         # Optional. When set, a breach is alerted FROM THE RUNNER (the secret
+#         # never enters the run-command payload / Azure logs). Omit it to rely
+#         # solely on the probe's own VM-side alerting.
+#         ALERT_WEBHOOK: ${{ secrets.SLACK_ALERT_WEBHOOK_URL }}
+
+on:
+  workflow_call:
+    inputs:
+      resource-group:
+        description: Azure resource group containing the target VM.
+        required: true
+        type: string
+      vm-name:
+        description: Target VM the deployed capability surface runs on.
+        required: true
+        type: string
+      probe-command:
+        description: |
+          The probe invocation run ON the VM (repo-agnostic). The pure logic
+          lives in the consumer repo; the command must self-source the gateway
+          env and read the LIVE config. The deep/shallow flag is appended by
+          this workflow. Example:
+            bash /opt/tc-agent-zone/current/agentops/apply/run-nightly-capability-probe.sh
+        required: true
+        type: string
+      run-as-user:
+        description: |
+          Unprivileged user to `sudo -u <user> -H bash -l` into before running the
+          probe, so stdio connectors inherit the gateway user's runtime env (e.g.
+          openclaw). Empty (default) runs the probe as root.
+        required: false
+        type: string
+        default: ''
+      config-path:
+        description: |
+          Path to the LIVE gateway config on the VM. When set it is exported as
+          OPENCLAW_CONFIG for the probe so it reads the config agents actually use —
+          never a repo heuristic. Empty (default) lets the probe resolve its own
+          default / env-configured path.
+        required: false
+        type: string
+        default: ''
+      deep:
+        description: |
+          'true' exercises connectors end-to-end (--deep; e.g. a real image
+          generation, costs ~one image); 'false' runs the shallow liveness probe
+          (--shallow). Validated before it is embedded.
+        required: false
+        type: string
+        default: 'true'
+      environment:
+        description: |
+          Deployment environment to attach the probe job to (for environment
+          protection rules / scoped WIF). Defaults to 'production' to match the
+          post-deploy posture; set to your own environment name if different.
+        required: false
+        type: string
+        default: 'production'
+      azure-client-id:
+        description: WIF identity client ID (typically vars.AZURE_CLIENT_ID).
+        required: true
+        type: string
+      azure-tenant-id:
+        description: Azure AD tenant ID (typically vars.AZURE_TENANT_ID).
+        required: true
+        type: string
+      azure-subscription-id:
+        description: Subscription ID (typically vars.AZURE_SUBSCRIPTION_ID).
+        required: true
+        type: string
+      fail-on-breach:
+        description: |
+          ALERT-tier control. 'true' (default) reds this run when the probe reports
+          an unreachable capability — a SECONDARY signal on top of the alert; the
+          run is never a PR-required context so it gates no merge. 'false' records
+          the breach + alerts but keeps the run green.
+        required: false
+        type: string
+        default: 'true'
+      artifact-name:
+        description: Name of the published machine-readable result artifact.
+        required: false
+        type: string
+        default: capability-health-result
+    secrets:
+      ALERT_WEBHOOK:
+        description: |
+          Optional. Slack-compatible incoming webhook. When provided, a breach is
+          POSTed FROM THE RUNNER (so the secret never enters the az run-command
+          payload / Azure logs). Omit to rely on the probe's own VM-side alerting.
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  probe:
+    name: live-connector runtime probe + measurement
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: WIF Azure login
+        uses: three-cubes/tc-pipelines/.github/actions/wif-azure-login@v1
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.azure-subscription-id }}
+
+      - name: Runtime tier — probe live capability health on the VM
+        id: probe
+        shell: bash
+        env:
+          RG: ${{ inputs.resource-group }}
+          VM: ${{ inputs.vm-name }}
+          PROBE_COMMAND: ${{ inputs.probe-command }}
+          RUN_AS_USER: ${{ inputs.run-as-user }}
+          CONFIG_PATH: ${{ inputs.config-path }}
+          DEEP: ${{ inputs.deep }}
+        run: |
+          set -euo pipefail
+
+          # `deep` is a free-text input — validate before it is embedded. Never
+          # trust a dispatch/choice value unchecked.
+          case "$DEEP" in
+            true) FLAG="--deep" ;;
+            false) FLAG="--shallow" ;;
+            *) echo "::error::deep must be 'true' or 'false'; got: $DEEP"; exit 1 ;;
+          esac
+
+          # Compose the VM-side invocation. The probe reads the LIVE gateway
+          # config (never a repo heuristic) and self-sources the gateway env so
+          # stdio connectors resolve; we thread through only the deep/shallow flag
+          # and the optional live config path. NO secret is embedded in the
+          # run-command payload — breach alerting is done from the runner.
+          INNER="${PROBE_COMMAND} ${FLAG}"
+          if [[ -n "$CONFIG_PATH" ]]; then
+            INNER="export OPENCLAW_CONFIG=$(printf '%q' "$CONFIG_PATH"); ${INNER}"
+          fi
+          if [[ -n "$RUN_AS_USER" ]]; then
+            REMOTE="sudo -u $(printf '%q' "$RUN_AS_USER") -H bash -lc $(printf '%q' "$INNER")"
+          else
+            REMOTE="bash -lc $(printf '%q' "$INNER")"
+          fi
+
+          OUTDIR="${RUNNER_TEMP}/capability-health"
+          mkdir -p "$OUTDIR"
+          MSG_FILE="${OUTDIR}/probe-output.txt"
+
+          echo "=== probing ${VM} (${RG}) ==="
+          # az vm run-command invoke returns 0 even when the remote script fails;
+          # the verdict is parsed from the message in the measurement step below.
+          az vm run-command invoke \
+            --resource-group "$RG" \
+            --name "$VM" \
+            --command-id RunShellScript \
+            --scripts "$REMOTE" \
+            --query 'value[0].message' -o tsv >"$MSG_FILE"
+
+          echo "----- BEGIN probe output (${VM}) -----"
+          cat "$MSG_FILE"
+          echo "----- END probe output (${VM}) -----"
+
+      - name: Measurement tier — publish machine-readable result
+        id: measure
+        shell: bash
+        env:
+          RG: ${{ inputs.resource-group }}
+          VM: ${{ inputs.vm-name }}
+          DEEP: ${{ inputs.deep }}
+        run: |
+          set -euo pipefail
+          OUTDIR="${RUNNER_TEMP}/capability-health"
+          export MSG_FILE="${OUTDIR}/probe-output.txt"
+          export RESULT_FILE="${OUTDIR}/capability-health-result.json"
+
+          # Parse the probe verdict into a normalised artifact + step outputs.
+          # Robust across a --json probe (the canonical shape) and a human-lines
+          # probe: it prefers the JSON payload, falls back to the SUMMARY line +
+          # per-capability FAIL markers, and treats an env-gated skip as a soft
+          # pass (never a breach).
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          msg_path = os.environ["MSG_FILE"]
+          result_path = os.environ["RESULT_FILE"]
+          try:
+              with open(msg_path, encoding="utf-8", errors="replace") as fh:
+                  raw = fh.read()
+          except OSError:
+              raw = ""
+
+          def find_json(text):
+              # First balanced {...} that parses AND carries the probe keys.
+              for start in (m.start() for m in re.finditer(r"\{", text)):
+                  depth = 0
+                  for i in range(start, len(text)):
+                      ch = text[i]
+                      if ch == "{":
+                          depth += 1
+                      elif ch == "}":
+                          depth -= 1
+                          if depth == 0:
+                              chunk = text[start:i + 1]
+                              try:
+                                  obj = json.loads(chunk)
+                              except ValueError:
+                                  break
+                              if isinstance(obj, dict) and (
+                                  "unreachable" in obj or "reachable" in obj
+                              ):
+                                  return obj
+                              break
+              return None
+
+          skipped = "live probe skipped" in raw
+          hard_fail = "FAIL capability-health-probe" in raw
+          parsed = find_json(raw)
+
+          result = {
+              "schema": "capability-health-probe/v1",
+              "vm": os.environ.get("VM", ""),
+              "resource_group": os.environ.get("RG", ""),
+              "deep": os.environ.get("DEEP", ""),
+              "skipped": skipped,
+          }
+
+          if parsed is not None:
+              unreachable = parsed.get("unreachable") or []
+              servers = parsed.get("servers")
+              reachable = parsed.get("reachable")
+              result.update({
+                  "parsed": True,
+                  "servers": servers,
+                  "reachable": reachable,
+                  "unreachable": unreachable,
+                  "results": parsed.get("results", []),
+                  "perf_regressions": parsed.get("perf_regressions", []),
+              })
+              breach = bool(unreachable) or hard_fail
+          else:
+              unreachable = re.findall(r"^\s*FAIL\s+(\S+)\s+\[", raw, re.MULTILINE)
+              m = re.search(r"SUMMARY[^:]*:\s*(\d+)\s*/\s*(\d+)\s+reachable", raw)
+              reachable = int(m.group(1)) if m else None
+              servers = int(m.group(2)) if m else None
+              result.update({
+                  "parsed": False,
+                  "servers": servers,
+                  "reachable": reachable,
+                  "unreachable": unreachable,
+              })
+              breach = (
+                  bool(unreachable)
+                  or hard_fail
+                  or (reachable is not None and servers is not None and reachable < servers)
+              )
+
+          if skipped:
+              breach = False
+          result["breach"] = breach
+
+          os.makedirs(os.path.dirname(result_path), exist_ok=True)
+          with open(result_path, "w", encoding="utf-8") as fh:
+              json.dump(result, fh, indent=2)
+
+          def emit(key, value):
+              gh = os.environ.get("GITHUB_OUTPUT")
+              if gh:
+                  with open(gh, "a", encoding="utf-8") as fh:
+                      fh.write(f"{key}={value}\n")
+
+          emit("breach", "true" if breach else "false")
+          emit("skipped", "true" if skipped else "false")
+          emit("reachable", "" if reachable is None else reachable)
+          emit("servers", "" if servers is None else servers)
+          emit("unreachable", ",".join(unreachable))
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as fh:
+                  fh.write("### Capability health probe\n\n")
+                  if skipped:
+                      fh.write(
+                          f"- Skipped (env-gated) on `{result['vm']}` — "
+                          "live gateway config not present.\n"
+                      )
+                  else:
+                      fh.write(
+                          f"- VM `{result['vm']}` — reachable "
+                          f"`{reachable}`/`{servers}`\n"
+                      )
+                      if unreachable:
+                          joined = ", ".join("`" + u + "`" for u in unreachable)
+                          fh.write(f"- Unreachable: {joined}\n")
+                      fh.write(
+                          "- Verdict: " + ("BREACH" if breach else "healthy") + "\n"
+                      )
+
+          print(json.dumps(result, indent=2))
+          PY
+
+      - name: Publish capability-health result artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}/capability-health/
+          if-no-files-found: warn
+
+      - name: Alert + breach gate
+        shell: bash
+        env:
+          VM: ${{ inputs.vm-name }}
+          BREACH: ${{ steps.measure.outputs.breach }}
+          SKIPPED: ${{ steps.measure.outputs.skipped }}
+          REACHABLE: ${{ steps.measure.outputs.reachable }}
+          SERVERS: ${{ steps.measure.outputs.servers }}
+          UNREACHABLE: ${{ steps.measure.outputs.unreachable }}
+          FAIL_ON_BREACH: ${{ inputs.fail-on-breach }}
+          ALERT_WEBHOOK: ${{ secrets.ALERT_WEBHOOK }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$SKIPPED" == "true" ]]; then
+            echo "capability-health probe env-gated (skipped) — no live verdict; passing."
+            exit 0
+          fi
+
+          if [[ "$BREACH" != "true" ]]; then
+            echo "capability-health probe: all configured capabilities reachable (${REACHABLE:-?}/${SERVERS:-?})."
+            exit 0
+          fi
+
+          # Breach path — ALERT-tier. Alert from the runner if a webhook was
+          # provided (the secret never enters the run-command payload), then
+          # optionally red the run as a SECONDARY signal. Never PR-blocking.
+          echo "::error::capability-health probe: unreachable on ${VM} — ${UNREACHABLE:-see run log}"
+          if [[ -n "${ALERT_WEBHOOK:-}" ]]; then
+            if curl -fsS -X POST -H 'Content-Type: application/json' \
+              --data "{\"text\":\"capability-health-probe: unreachable on ${VM} — ${UNREACHABLE:-see run log}\"}" \
+              "$ALERT_WEBHOOK"; then
+              echo "alerted via ALERT_WEBHOOK"
+            else
+              echo "::warning::alert POST to ALERT_WEBHOOK failed"
+            fi
+          else
+            echo "::notice::no ALERT_WEBHOOK secret configured — breach not alerted from the runner (VM-side alerting, if any, still applies)"
+          fi
+
+          if [[ "$FAIL_ON_BREACH" == "true" ]]; then
+            exit 1
+          fi
+          echo "::warning::fail-on-breach is false — breach recorded but the run stays green (ALERT-tier)"
