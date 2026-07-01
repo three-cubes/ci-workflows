@@ -1,0 +1,46 @@
+{
+  "_comment": "PRODUCT profile (SGO-180) — 0-review-via-queue. For product repos (e.g. kairix) once their gate is hardened to gate-hardening.md and verified green, then flipped. Adopting this file does NOT turn on lights-out until a repo applies it AND enables the merge queue in the web UI.",
+  "_comment_review": "required_approving_review_count = 0: WORK merges on a GREEN gate with no human. require_code_owner_review = true keeps the CONTROL PLANE (the gate's own definition) HITL — see governance/CODEOWNERS (two-tier). The gate is the only control, so 'green' must be trustworthy: invest in the required checks below and keep them deterministic.",
+  "_comment_required_checks": "The required set that makes green trustworthy enough for 0-review (gate-hardening.md): 'CI gate' (the fan-in check-run), 'Independent verifier' and 'Mutation' PROMOTED to required contexts, and 'SonarCloud scan' (new-code honest-green). Ship 'Independent verifier' ADVISORY first (informational, NOT in this set) and add it here only once its measured false-fail rate is acceptable — a flaky required check causes agent loops.",
+  "_comment_merge_queue": "The merge_queue rule is deliberately NOT in this file: the REST rulesets API returns 422 for it. Enable it via Settings -> Rules -> Rulesets in the web UI using governance/rulesets/merge-queue.json as the snapshot. Cross-ref: MERGE-QUEUE-D1.md (Issue 2).",
+  "_comment_bypass": "bypass_actors is EMPTY by design — no actor (including agent App identities) may bypass the rules. ADRs: STD-MERGE, RULESET-D1, CODEOWNERS-D1, GATE-HARDEN.",
+  "name": "main-product",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {
+      "include": ["~DEFAULT_BRANCH"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 0,
+        "dismiss_stale_reviews_on_push": false,
+        "require_code_owner_review": true,
+        "require_last_push_approval": false,
+        "required_review_thread_resolution": false,
+        "required_reviewers": [],
+        "allowed_merge_methods": ["squash"]
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": false,
+        "do_not_enforce_on_create": false,
+        "required_status_checks": [
+          { "context": "CI gate" },
+          { "context": "Independent verifier" },
+          { "context": "Mutation" },
+          { "context": "SonarCloud scan" }
+        ]
+      }
+    }
+  ]
+}

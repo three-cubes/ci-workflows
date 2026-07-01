@@ -1,0 +1,99 @@
+name: dependabot-automerge
+
+# Reusable (workflow_call) TEMPLATE (SGO-171, folds SGO-97).
+#
+# Grouped patch / minor / dev Dependabot updates auto-merge once the required
+# gates pass; MAJOR bumps are excluded and stay HITL. This composes the Issue-1
+# fan-in-check auto-merge mechanism (auto-merge-on-green.yml) with a
+# dependabot/fetch-metadata update-type gate.
+#
+# The DEP-D1 3-day cooldown already lives in governance/dependabot.yml — a PR
+# only APPEARS post-cooldown, so this workflow adds NO extra timer and preserves
+# the supply-chain posture. It fires only for the dependabot[bot] actor.
+#
+# Adopting this file does NOT turn on lights-out — see auto-merge-on-green.yml.
+# Acts as the three-cubes-agent App with NO LLM/AI self-attribution (D1).
+
+on:
+  workflow_call:
+    inputs:
+      fan-in-check-name:
+        description: "Fan-in CHECK-RUN name passed through to auto-merge-on-green."
+        type: string
+        default: "CI gate"
+      merge-method:
+        description: "Direct-mode merge method: squash | merge | rebase."
+        type: string
+        default: squash
+      enqueue:
+        description: "true -> queue mode; false -> direct auto-merge."
+        type: boolean
+        default: false
+      azure-client-id:
+        description: "WIF managed-identity client id (typically vars.AZURE_CLIENT_ID)."
+        type: string
+        required: true
+      azure-tenant-id:
+        description: "Azure AD tenant id (typically vars.AZURE_TENANT_ID)."
+        type: string
+        required: true
+      azure-subscription-id:
+        description: "Subscription id (typically vars.AZURE_SUBSCRIPTION_ID)."
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    # Only Dependabot's own PRs are eligible.
+    if: ${{ github.actor == 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      eligible: ${{ steps.decide.outputs.eligible }}
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@08eff52bf64351f401fb50d4972fa95b9f2c2d1b # v2.4.0
+
+      - name: Decide eligibility (patch/minor/dev — never major)
+        id: decide
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          DEPENDENCY_TYPE: ${{ steps.meta.outputs.dependency-type }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          eligible="false"
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch|version-update:semver-minor) eligible="true" ;;
+            version-update:semver-major) eligible="false" ;;
+          esac
+          # dev-dependency (non-major) updates are also eligible.
+          if [ "$UPDATE_TYPE" != "version-update:semver-major" ] \
+            && printf '%s' "$DEPENDENCY_TYPE" | grep -q 'development'; then
+            eligible="true"
+          fi
+          echo "eligible=${eligible}" >> "$GITHUB_OUTPUT"
+          echo "dependabot-automerge: update-type='${UPDATE_TYPE}'" \
+            "dependency-type='${DEPENDENCY_TYPE}' -> eligible=${eligible}" \
+            "(major stays HITL; DEP-D1 3-day cooldown already gated arrival)."
+
+  auto-merge:
+    needs: gate
+    if: ${{ needs.gate.outputs.eligible == 'true' }}
+    # Reuse the Issue-1 fan-in-check auto-merge mechanism. The local `./` path
+    # resolves within tc-pipelines at whatever ref a consumer pins this reusable
+    # to, so the two templates version together.
+    uses: ./.github/workflows/auto-merge-on-green.yml
+    with:
+      fan-in-check-name: ${{ inputs.fan-in-check-name }}
+      merge-method: ${{ inputs.merge-method }}
+      enqueue: ${{ inputs.enqueue }}
+      azure-client-id: ${{ inputs.azure-client-id }}
+      azure-tenant-id: ${{ inputs.azure-tenant-id }}
+      azure-subscription-id: ${{ inputs.azure-subscription-id }}

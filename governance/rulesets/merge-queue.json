@@ -1,0 +1,30 @@
+{
+  "_comment": "GitHub merge-queue ruleset fragment (SGO-168) — a WEB-UI-ONLY template. See governance/decisions/MERGE-QUEUE-D1.md.",
+  "_comment_422_gotcha": "The `merge_queue` rule CANNOT be created via the REST rulesets API — POST/PUT /repos/{o}/{r}/rulesets returns HTTP 422 for it. It MUST be enabled via Settings -> Rules -> Rulesets in the web UI. This mirrors the _comment convention in kairix .github/rulesets/main.json so that re-applying a JSON snapshot never silently drops the queue. Keep this fragment as the source-of-truth SNAPSHOT of the web-UI settings; do NOT `gh api ... --input merge-queue.json` it.",
+  "_comment_scope": "Applies to PRODUCT repos only (re-test-vs-tip / not-rocket-science). Small config/data repos may keep auto-merge-no-queue — see MERGE-QUEUE-D1.md and its reconciliation with kata ADR-013.",
+  "_comment_merge_group_trigger": "A product repo's fan-in 'CI gate' job MUST also report on `merge_group` events, or the queue can never go green. Add `merge_group:` to the `on:` of the repo's ci.yml (snippet in MERGE-QUEUE-D1.md).",
+  "name": "main-merge-queue",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {
+      "include": ["~DEFAULT_BRANCH"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "merge_queue",
+      "parameters": {
+        "grouping_strategy": "ALLGREEN",
+        "min_entries_to_merge": 1,
+        "max_entries_to_merge": 5,
+        "min_entries_to_merge_wait_minutes": 5,
+        "max_entries_to_build": 5,
+        "merge_method": "SQUASH",
+        "check_response_timeout_minutes": 60
+      }
+    }
+  ]
+}

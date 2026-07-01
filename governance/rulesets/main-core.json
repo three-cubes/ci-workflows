@@ -1,0 +1,46 @@
+{
+  "_comment": "CORE profile (SGO-180) — the LOCKED n+1-human exception for the two CORE repos (tc-pipelines, tc-fitness). Same trustworthy-green gate as the product profile, PLUS at least one human approval, because these repos DEFINE the gate that gates everything else. tc-fitness applies THIS profile; kairix applies main-product.json.",
+  "_comment_review": "required_approving_review_count >= 1 with require_code_owner_review = true: a change to the control plane cannot merge without a human maintainer. This is the belt-and-braces exception to 0-review — an agent must never be able to weaken the gate that gates it. See governance/CODEOWNERS (two-tier) documented against both profiles.",
+  "_comment_required_checks": "Identical required set to main-product.json: 'CI gate', 'Independent verifier', 'Mutation', 'SonarCloud scan' (gate-hardening.md). Human review is ADDITIVE here, not a substitute for a green gate.",
+  "_comment_no_queue": "CORE repos merge DIRECTLY (auto-merge, no queue) — no merge_queue rule. Queueing is scoped to product repos (re-test-vs-tip). Cross-ref: MERGE-QUEUE-D1.md.",
+  "_comment_bypass": "bypass_actors is EMPTY by design. ADRs: STD-MERGE, RULESET-D1, CODEOWNERS-D1, GATE-HARDEN.",
+  "name": "main-core",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {
+      "include": ["~DEFAULT_BRANCH"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 1,
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": true,
+        "require_last_push_approval": true,
+        "required_review_thread_resolution": false,
+        "required_reviewers": [],
+        "allowed_merge_methods": ["squash"]
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": false,
+        "do_not_enforce_on_create": false,
+        "required_status_checks": [
+          { "context": "CI gate" },
+          { "context": "Independent verifier" },
+          { "context": "Mutation" },
+          { "context": "SonarCloud scan" }
+        ]
+      }
+    }
+  ]
+}

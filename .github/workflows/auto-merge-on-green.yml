@@ -1,0 +1,123 @@
+name: auto-merge-on-green
+
+# Reusable (workflow_call) TEMPLATE for SAFE lights-out merge (SGO-166).
+#
+# Keyed off the fan-in "CI gate" CHECK-RUN, not the umbrella ci.yml workflow run.
+# This is the load-bearing distinction that regression-locks the kairix #548
+# behaviour: an INFORMATIONAL job (e.g. SonarCloud) that reds the overall run
+# must NOT block auto-merge. We resolve ONLY the named fan-in check-run's
+# conclusion and enable auto-merge exclusively when it is `success`.
+#
+# Adopting this file does NOT turn on lights-out. Auto-merge only takes effect
+# once a repo also configures branch protection / a ruleset that permits it
+# (governance/rulesets/main-product.json) and a maintainer flips it on.
+#
+# Acts as the three-cubes-agent GitHub App (minted via WIF, secret-free) and
+# writes NO LLM/AI self-attribution — `gh pr merge` keeps the PR's own title and
+# body; we add no trailers, credits, or robot emoji (Autonomous Delivery D1).
+
+on:
+  workflow_call:
+    inputs:
+      fan-in-check-name:
+        description: >-
+          Name of the fan-in CHECK-RUN that gates the merge. Its conclusion is
+          the ONLY signal read — the umbrella workflow run is ignored, so an
+          informational job that reds the run does not block (kairix #548 lock).
+        type: string
+        default: "CI gate"
+      merge-method:
+        description: "Direct-mode merge method: squash | merge | rebase."
+        type: string
+        default: squash
+      enqueue:
+        description: >-
+          true  -> queue mode: `gh pr merge --auto` (the branch's merge_queue
+                   ruleset applies its own method; see governance/rulesets/merge-queue.json).
+          false -> direct mode: `gh pr merge --auto --<merge-method>`.
+        type: boolean
+        default: false
+      pr-number:
+        description: "PR number to act on. Empty -> the pull_request event's number."
+        type: string
+        default: ""
+      head-sha:
+        description: "HEAD SHA whose check-runs are read. Empty -> the pull_request head sha."
+        type: string
+        default: ""
+      azure-client-id:
+        description: "WIF managed-identity client id (typically vars.AZURE_CLIENT_ID)."
+        type: string
+        required: true
+      azure-tenant-id:
+        description: "Azure AD tenant id (typically vars.AZURE_TENANT_ID)."
+        type: string
+        required: true
+      azure-subscription-id:
+        description: "Subscription id (typically vars.AZURE_SUBSCRIPTION_ID)."
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - name: Mint three-cubes-agent App token (WIF, secret-free)
+        id: app
+        uses: three-cubes/tc-pipelines/.github/actions/github-app-token@v1
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.azure-subscription-id }}
+
+      - name: Enable auto-merge only when the fan-in check-run is green
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          CHECK_NAME: ${{ inputs.fan-in-check-name }}
+          MERGE_METHOD: ${{ inputs.merge-method }}
+          ENQUEUE: ${{ inputs.enqueue }}
+          PR: ${{ inputs.pr-number || github.event.pull_request.number }}
+          SHA: ${{ inputs.head-sha || github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PR" ] || [ -z "$SHA" ]; then
+            echo "auto-merge-on-green: no PR / HEAD sha in context — nothing to do."
+            exit 0
+          fi
+
+          case "$MERGE_METHOD" in
+            squash|merge|rebase) : ;;
+            *) echo "::error::auto-merge-on-green: invalid merge-method '$MERGE_METHOD' (want squash|merge|rebase)."; exit 1 ;;
+          esac
+
+          # Resolve ONLY the named fan-in check-run's conclusion. `env.CHECK_NAME`
+          # keeps the name out of the jq program text (no injection). The F83
+          # `|| runs=''` guard keeps `set -e` from aborting on an empty/absent
+          # check-run — an absent fan-in must yield "no auto-merge", not a crash.
+          runs="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs" \
+            --jq '.check_runs[] | select(.name == env.CHECK_NAME) | .conclusion')" || runs=''
+          conclusion="$(printf '%s\n' "$runs" | head -n1)"
+
+          if [ "$conclusion" != "success" ]; then
+            echo "auto-merge-on-green: fan-in '$CHECK_NAME' is '${conclusion:-<absent>}'" \
+              "(need 'success') — NOT enabling auto-merge. Exiting green."
+            exit 0
+          fi
+
+          echo "auto-merge-on-green: fan-in '$CHECK_NAME' is success — enabling auto-merge on PR #$PR."
+          if [ "$ENQUEUE" = "true" ]; then
+            # Queue mode: the branch's merge_queue ruleset re-tests vs the latest
+            # tip and applies its configured method (governance/rulesets/merge-queue.json).
+            gh pr merge "$PR" --auto
+          else
+            gh pr merge "$PR" --auto "--$MERGE_METHOD"
+          fi

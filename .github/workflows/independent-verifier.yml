@@ -1,0 +1,251 @@
+name: independent-verifier
+
+# fan-in: informational
+#
+# Reusable (workflow_call) CONTRACT for the fresh-context independent verifier
+# (SGO-169). A verifier that had NO part in authoring a PR re-checks the PR diff
+# against the linked Linear issue's acceptance criteria, in a FRESH agent context
+# with no shared state or chain-of-thought carried over from the authoring agent.
+#
+# It emits a check-run named "Independent verifier" (pass/fail + a rationale) and
+# ships ADVISORY first: the `# fan-in: informational` marker above signals it is
+# NOT a required context. Only after its measured false-fail rate is acceptable
+# should a repo promote it to a required context (gate-hardening.md Determinism
+# section — a flaky REQUIRED check causes agent loops).
+#
+# HONEST-by-construction: the agent-runtime call is a clearly-marked PLACEHOLDER
+# (see the "agent-runtime" step). Until it is wired, the check emits a NEUTRAL
+# SKIP with fix:/next: guidance — it NEVER fabricates a verdict and NEVER emits a
+# false pass. A branch with no resolvable Linear id is a documented SKIP too.
+#
+# Acts as the three-cubes-agent App and writes NO LLM/AI self-attribution
+# (Autonomous Delivery D1).
+
+on:
+  workflow_call:
+    inputs:
+      advisory:
+        description: >-
+          true (default) -> informational: the check-run reflects the verdict but
+          the job always exits 0, so it never blocks even if wired as required.
+          false -> a FAIL verdict also fails the job for local visibility.
+        type: boolean
+        default: true
+      model:
+        description: "Agent-runtime model id (per the claude-api skill)."
+        type: string
+        default: "claude-opus-4-8"
+      effort:
+        description: "output_config.effort for the agent-runtime call."
+        type: string
+        default: "high"
+      linear-branch:
+        description: "Head branch to resolve the Linear id from. Empty -> github.head_ref."
+        type: string
+        default: ""
+      azure-client-id:
+        description: "WIF managed-identity client id (typically vars.AZURE_CLIENT_ID)."
+        type: string
+        required: true
+      azure-tenant-id:
+        description: "Azure AD tenant id (typically vars.AZURE_TENANT_ID)."
+        type: string
+        required: true
+      azure-subscription-id:
+        description: "Subscription id (typically vars.AZURE_SUBSCRIPTION_ID)."
+        type: string
+        required: true
+    secrets:
+      linear-api-key:
+        description: "Linear API key used to fetch the issue's acceptance criteria."
+        required: false
+      agent-runtime-token:
+        description: "Token for the org agent runtime (claude-direct / cli-proxy-api)."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      checks: write
+      pull-requests: read
+    steps:
+      - name: Mint three-cubes-agent App token (WIF, secret-free)
+        id: app
+        uses: three-cubes/tc-pipelines/.github/actions/github-app-token@v1
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.azure-subscription-id }}
+
+      - name: Resolve the Linear issue id from the head branch
+        id: resolve
+        env:
+          LINEAR_BRANCH: ${{ inputs.linear-branch }}
+          HEAD_REF: ${{ github.head_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH="${LINEAR_BRANCH:-$HEAD_REF}"
+          issue_id=""
+          # Linear "copy git branch name" shape: <user>/<team>-<n>-<slug>.
+          if [[ "$BRANCH" =~ ^[^/]+/([A-Za-z]+-[0-9]+)- ]]; then
+            issue_id="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:lower:]' '[:upper:]')"
+          fi
+          echo "issue-id=${issue_id}" >> "$GITHUB_OUTPUT"
+          if [ -z "$issue_id" ]; then
+            echo "independent-verifier: branch '$BRANCH' has no <team>-<n> segment."
+          else
+            echo "independent-verifier: resolved Linear id '$issue_id' from branch '$BRANCH'."
+          fi
+
+      - name: Fetch the issue's acceptance criteria from Linear
+        id: criteria
+        env:
+          ISSUE_ID: ${{ steps.resolve.outputs.issue-id }}
+          LINEAR_API_KEY: ${{ secrets.linear-api-key }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > criteria.txt
+          resolvable="false"
+          if [ -z "$ISSUE_ID" ]; then
+            echo "independent-verifier: no Linear id — cannot fetch criteria."
+            echo "resolvable=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "${LINEAR_API_KEY:-}" ]; then
+            echo "independent-verifier: linear-api-key not provided — cannot fetch criteria."
+            echo "resolvable=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          team="${ISSUE_ID%-*}"
+          number="${ISSUE_ID##*-}"
+          jq -n --arg team "$team" --argjson number "$number" \
+            '{query:"query($team:String!,$number:Float!){issues(filter:{team:{key:{eq:$team}},number:{eq:$number}}){nodes{identifier title description}}}",variables:{team:$team,number:$number}}' \
+            > query.json
+          resp="$(curl -sS -X POST https://api.linear.app/graphql \
+            -H "Authorization: ${LINEAR_API_KEY}" \
+            -H "Content-Type: application/json" \
+            --data @query.json)" || resp=""
+          desc="$(printf '%s' "$resp" | jq -r '.data.issues.nodes[0].description // empty')"
+          if [ -n "$desc" ]; then
+            printf '%s\n' "$desc" > criteria.txt
+            resolvable="true"
+            echo "independent-verifier: fetched acceptance criteria for '$ISSUE_ID'."
+          else
+            echo "independent-verifier: Linear returned no criteria for '$ISSUE_ID'."
+          fi
+          echo "resolvable=${resolvable}" >> "$GITHUB_OUTPUT"
+
+      - name: Independent verifier — agent-runtime call (PLACEHOLDER)
+        id: agent
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          RESOLVABLE: ${{ steps.criteria.outputs.resolvable }}
+          HEAD_REF: ${{ github.head_ref }}
+          PR: ${{ github.event.pull_request.number }}
+          MODEL: ${{ inputs.model }}
+          EFFORT: ${{ inputs.effort }}
+          AGENT_RUNTIME_URL: ${{ vars.AGENT_RUNTIME_URL }}
+          AGENT_RUNTIME_TOKEN: ${{ secrets.agent-runtime-token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Deterministic fallback: no resolvable Linear id -> documented SKIP,
+          # NEVER a false pass.
+          if [ "$RESOLVABLE" != "true" ]; then
+            {
+              echo "verdict=skip"
+              echo "rationale=No resolvable Linear acceptance criteria for branch '${HEAD_REF}'. fix: rename the head branch to the Linear 'copy git branch name' shape <user>/<team>-<n>-<slug> (e.g. dan/sgo-166-...). next: wire linear-api-key so the verifier can fetch the issue."
+            } >> "$GITHUB_OUTPUT"
+            echo "independent-verifier: SKIP (unresolvable) — neutral, never a false pass."
+            exit 0
+          fi
+
+          # Prepare the agent inputs: the fetched criteria + the PR diff.
+          gh pr diff "$PR" -R "$GITHUB_REPOSITORY" > diff.txt || true
+
+          # ───────────────────────────────────────────────────────────────────
+          # PLACEHOLDER — the fresh-context agent-runtime call belongs HERE.
+          #
+          # Wire this to the org Claude agent (claude-direct / cli-proxy-api
+          # routing). The call MUST run in a FRESH context: a new session with NO
+          # system prompt, history, or chain-of-thought carried from the authoring
+          # agent — that independence is the entire point of this check.
+          #
+          # Request contract (per the `claude-api` skill — do NOT invent params):
+          #   POST "$AGENT_RUNTIME_URL"/v1/messages   (Anthropic-compatible)
+          #   headers: x-api-key: "$AGENT_RUNTIME_TOKEN"; anthropic-version: 2023-06-01
+          #   body:
+          #     model:         "$MODEL"                # default claude-opus-4-8
+          #     max_tokens:    16000
+          #     thinking:      {"type": "adaptive"}
+          #     output_config: {"effort": "$EFFORT",   # default high
+          #                     "format": {"type": "json_schema",
+          #                       "schema": {"type":"object","additionalProperties":false,
+          #                         "required":["verdict","rationale"],
+          #                         "properties":{
+          #                           "verdict":{"type":"string","enum":["pass","fail"]},
+          #                           "rationale":{"type":"string"}}}}}
+          #     messages: one user turn = contents of criteria.txt + diff.txt,
+          #               asking whether the diff satisfies EVERY criterion.
+          #   Parse the returned JSON into verdict (pass|fail) + rationale.
+          #
+          # Until this placeholder is replaced with the real call, FAIL SAFE: emit
+          # a neutral SKIP. We never fabricate a verdict and never emit `pass`
+          # from the template — that would be a false green.
+          # ───────────────────────────────────────────────────────────────────
+          if [ "${INDEPENDENT_VERIFIER_WIRED:-false}" != "true" ]; then
+            {
+              echo "verdict=skip"
+              echo "rationale=Agent-runtime call is an unwired PLACEHOLDER in this template. fix: implement the claude-direct / cli-proxy-api call at the marked step (model ${MODEL}, adaptive thinking, effort ${EFFORT}, FRESH context) and set INDEPENDENT_VERIFIER_WIRED=true. next: keep this check informational (advisory) until its measured false-fail rate is acceptable, then promote to a required context."
+            } >> "$GITHUB_OUTPUT"
+            echo "independent-verifier: SKIP (placeholder not wired) — neutral, never a false pass."
+            exit 0
+          fi
+
+          echo "::error::independent-verifier: INDEPENDENT_VERIFIER_WIRED=true but the agent-runtime call is still the placeholder. Implement it before enabling."
+          exit 1
+
+      - name: Emit the "Independent verifier" check-run
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          VERDICT: ${{ steps.agent.outputs.verdict }}
+          RATIONALE: ${{ steps.agent.outputs.rationale }}
+          ADVISORY: ${{ inputs.advisory }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$VERDICT" in
+            pass) conclusion="success"; title="Independent verifier: PASS" ;;
+            fail) conclusion="failure"; title="Independent verifier: FAIL" ;;
+            *)    conclusion="neutral"; title="Independent verifier: SKIP" ;;
+          esac
+          summary="${RATIONALE:-No rationale provided.}"
+          if [ -z "$HEAD_SHA" ]; then
+            echo "independent-verifier: no head sha in context — cannot emit check-run."
+            exit 0
+          fi
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/check-runs" \
+            -f "name=Independent verifier" \
+            -f "head_sha=$HEAD_SHA" \
+            -f "status=completed" \
+            -f "conclusion=$conclusion" \
+            -f "output[title]=$title" \
+            -f "output[summary]=$summary" >/dev/null
+          echo "independent-verifier: emitted check-run '$title' (conclusion=$conclusion)."
+
+          # Advisory (informational) never blocks the job. Once promoted to a
+          # required context, a FAIL check-run blocks the merge on its own; set
+          # advisory=false to ALSO fail the job for local visibility.
+          if [ "$ADVISORY" != "true" ] && [ "$conclusion" = "failure" ]; then
+            exit 1
+          fi
