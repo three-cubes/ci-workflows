@@ -16,6 +16,13 @@ name: docker-build-publish
 # secret and this workflow logs in with it. Either way the credential lives in
 # the caller's org/repo secrets, never in this file.
 #
+# SUPPLY CHAIN (opt-in, `sign: true`, default false — the HITL release path is
+# unchanged when off): build-push-action attaches SLSA provenance + an SBOM to
+# the pushed image index, and cosign keyless-signs the pushed DIGEST via GitHub
+# OIDC (Fulcio/Rekor). This stays secret-free by construction — keyless signing
+# mints a short-lived OIDC token, never a long-lived cosign key. See
+# docs/verifying-images.md for the consumer-side verification recipe.
+#
 # Per-repo differences are inputs with kairix-shaped defaults:
 #   - kairix publishes ghcr.io/three-cubes/kairix with the event-driven
 #     alpha/stable/main tag strategy and a setuptools-scm dev version on main.
@@ -124,6 +131,21 @@ on:
           (mutually exclusive with push in practice; useful for build-only CI).
         type: boolean
         default: false
+      # ── Supply chain: SLSA provenance + SBOM + keyless signing ──────────
+      sign:
+        description: >-
+          Opt-in supply-chain hardening (default false, so the HITL release
+          path is byte-for-byte unchanged when off). When true AND `push` is
+          true, build-push-action attaches SLSA provenance (provenance:true)
+          and an SBOM (sbom:true) to the pushed image index, and a keyless
+          cosign step signs the pushed DIGEST via GitHub OIDC (Fulcio/Rekor) —
+          no long-lived key. Requires the job's id-token: write permission
+          (granted below) and a caller whose registry token can write packages
+          (the cosign signature is pushed alongside the image). No-op on a
+          load-only build (nothing is pushed to sign). Verification recipe:
+          docs/verifying-images.md.
+        type: boolean
+        default: false
       cache-from:
         description: "build-push-action cache-from spec."
         type: string
@@ -162,6 +184,14 @@ jobs:
   build-and-push:
     name: Build and publish image
     runs-on: ${{ inputs.runs-on }}
+    permissions:
+      # contents: read is unchanged from the workflow default. id-token: write
+      # lets the keyless cosign step (inputs.sign) mint a short-lived OIDC token
+      # for Fulcio/Rekor — it grants a capability, not an action, and is inert
+      # when signing is off. The caller must ALSO grant id-token: write for the
+      # token to be issued to this reusable workflow.
+      contents: read
+      id-token: write
     env:
       # `secrets` is not a valid context in step-level `if:`. Capture whether a
       # registry password was supplied at the job level so the login step can
@@ -284,6 +314,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and publish
+        id: build
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: ${{ inputs.build-context }}
@@ -293,3 +324,34 @@ jobs:
           build-args: ${{ steps.buildargs.outputs.args }}
           cache-from: ${{ inputs.cache-from }}
           cache-to: ${{ inputs.cache-to }}
+          # Supply-chain attestations, opt-in via `sign` (default false =>
+          # unchanged behaviour). Gated on `push` too: attestations only make
+          # sense on a pushed index, and buildkit can't `load` an image index
+          # carrying attestation manifests into the docker daemon. provenance:true
+          # emits an SLSA provenance attestation, sbom:true an SBOM; both are
+          # attached to the pushed image index whose digest is signed below.
+          provenance: ${{ inputs.sign && inputs.push }}
+          sbom: ${{ inputs.sign && inputs.push }}
+
+      - name: Install cosign
+        # Keyless signing only — no key material is installed or referenced.
+        if: ${{ inputs.sign && inputs.push }}
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+
+      - name: Sign image (keyless, OIDC)
+        # Signs the DIGEST emitted by the build step — never re-resolves a tag,
+        # so exactly the bytes we pushed are what gets signed (and the signed
+        # index digest transitively covers the provenance/SBOM manifests it
+        # references). cosign reuses the registry login from the "Login to
+        # registry" step to push the signature; the signing identity is a
+        # short-lived Fulcio cert minted from the job's id-token (Rekor logs
+        # it) — no long-lived key. DIGEST/IMAGE flow through env, never
+        # interpolated into the shell, per workflow-injection hygiene.
+        if: ${{ inputs.sign && inputs.push }}
+        shell: bash
+        env:
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE}@${DIGEST}"
