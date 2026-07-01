@@ -224,6 +224,11 @@ jobs:
           # Full history so the PR commit range (base..head) resolves — the leg
           # scans EVERY commit message in that range, not just the tip.
           fetch-depth: 0
+      - name: Install uv
+        # The no-attribution scan resolves the tc-fitness detector via `uvx`;
+        # ubuntu-latest ships no uv, so install it here (else `uvx: command not
+        # found` is misread by the scan as a positive detection and fails every PR).
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
       - name: Reject AI/LLM self-attribution in commits + PR title/body
         shell: bash
         # ONE detector: the tc-fitness `no_llm_attribution` scan the local
@@ -258,6 +263,18 @@ jobs:
             fi
           }
 
+          # Advisory variant: warns on a hit but does NOT fail the gate. Used for
+          # the PR BODY only, which legitimately QUOTES the banned patterns when a
+          # PR documents the no-attribution policy itself (a text scan can't tell
+          # documentation from real attribution). The DURABLE artifacts — every
+          # commit message, the PR title, and the code (via the fitness rule) —
+          # stay blocking below, so clean git history is still enforced.
+          scan_advisory() {
+            if ! uvx --from "$from" python -m "$module" --scan-file "$2"; then
+              echo "::warning::no-attribution: possible AI/LLM self-attribution in $1 (advisory, not blocking — confirm it is documentation, not real residue)." >&2
+            fi
+          }
+
           # (a) every commit message in the PR range (base..head). Fall back to
           # HEAD's own message when there is no PR context (e.g. a push caller),
           # so the reusable never hard-fails outside a pull_request.
@@ -278,7 +295,7 @@ jobs:
           printf '%s' "$PR_TITLE" > "$workdir/pr-title.txt"
           scan "PR title" "$workdir/pr-title.txt"
           printf '%s' "$PR_BODY" > "$workdir/pr-body.txt"
-          scan "PR body" "$workdir/pr-body.txt"
+          scan_advisory "PR body" "$workdir/pr-body.txt"
 
           if [[ "$rc" -ne 0 ]]; then
             echo "::error::no-attribution: remove the AI/LLM self-attribution" \
