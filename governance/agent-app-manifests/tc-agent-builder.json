@@ -1,0 +1,22 @@
+{
+  "name": "tc-agent-builder",
+  "description": "GitHub App identity for the Builder agent (engineering + platform). Full SDLC tier. Mints short-lived installation tokens; not a repo admin — gated by the main ruleset + CODEOWNERS.",
+  "url": "https://github.com/three-cubes/tc-agent-zone",
+  "public": false,
+  "default_events": [],
+  "hook_attributes": { "active": false },
+  "default_permissions": {
+    "actions": "write",
+    "administration": "read",
+    "checks": "write",
+    "contents": "write",
+    "deployments": "write",
+    "issues": "write",
+    "metadata": "read",
+    "pull_requests": "write",
+    "statuses": "write",
+    "workflows": "write",
+    "security_events": "write",
+    "vulnerability_alerts": "read"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "tc-agent-consultant",
+  "description": "GitHub App identity for the Consultant agent (research / IP / methodology). Contributor tier: contributes docs + deliverables via PRs. Cannot merge gates, edit workflows, or touch security/deploy.",
+  "url": "https://github.com/three-cubes/tc-agent-zone",
+  "public": false,
+  "default_events": [],
+  "hook_attributes": { "active": false },
+  "default_permissions": {
+    "contents": "write",
+    "issues": "write",
+    "metadata": "read",
+    "pull_requests": "write"
+  }
+}

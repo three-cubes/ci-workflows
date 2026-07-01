@@ -17,6 +17,8 @@ without hand-copying drift. Consumed by
 | [`CODEOWNERS`](CODEOWNERS) | **Two-tier** review routing — only the control plane (the gate's own definition) is owned, so work merges autonomously on a green gate while gate-defining changes need a human. **No `* @OWNER`. Replace `@OWNER`** with your human team. | committed to the target repo's `.github/CODEOWNERS` |
 | [`dependabot.yml`](dependabot.yml) | 3-day-cooldown dependency policy (pip + npm + github-actions), grouped, security-toggle-OFF. | committed to `.github/dependabot.yml` |
 | [`pre-commit-config.yaml`](pre-commit-config.yaml) | The cheap local gate (hygiene + detect-secrets + actionlint + shellcheck + ruff + bandit) before the CI round-trip. | committed to `.pre-commit-config.yaml` |
+| [`agent-sdlc-access-and-hitl.md`](agent-sdlc-access-and-hitl.md) | The canonical SDLC-access + HITL standard: capability (per-agent GitHub Apps) vs enforcement (the gates a human owns). | read + apply per repo |
+| [`agent-app-manifests/`](agent-app-manifests/) | The canonical per-agent GitHub App set (`tc-agent-builder`/`shape`/`consultant`/`growth`) with tiered permissions. Minted by the `agent-token` CLI + `github-app-token` action (`--agent`/`agent:`). | one App created per manifest by the org owner |
 
 These are a **starting baseline** — a repo trims/extends them (drop `npm` if it
 ships no JS; add repo-specific CODEOWNERS paths or pre-commit hooks). The
