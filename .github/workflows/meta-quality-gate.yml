@@ -36,6 +36,14 @@ on:
         description: "Assert the head branch matches the org branch-naming shape."
         type: boolean
         default: true
+      run-no-attribution:
+        description: >-
+          Reject AI/LLM self-attribution residue in the PR's commit messages and
+          in the PR title + body (Autonomous Delivery Platform decision D1). Uses
+          the shared tc-fitness no_llm_attribution detector in READ-ONLY mode — CI
+          never rewrites history.
+        type: boolean
+        default: true
       yamllint-paths:
         description: >-
           Space-separated paths yamllint scans. Default covers the workflow +
@@ -65,6 +73,15 @@ on:
           (`main`, `develop`, automation) are skipped before the match.
         type: string
         default: "^[a-z][a-z0-9-]*/[a-z0-9][a-z0-9_/-]*$"
+      no-attribution-fitness-ref:
+        description: >-
+          tc-fitness git ref the no-attribution leg resolves the shared
+          no_llm_attribution detector from (must ship the `--scan-file`
+          read-only seam, i.e. >= v0.7.1). Pin per repo to the engine the
+          local commit-msg hook + fitness gate use, so the three surfaces
+          share one pattern set and can never drift.
+        type: string
+        default: "v0.7.1"
 
 permissions:
   contents: read
@@ -193,3 +210,81 @@ jobs:
             "'$BRANCH_PATTERN'. fix: rename to the org '<user>/<slug>' shape" \
             "(e.g. dan/meta-quality-gate): git branch -m <new-name>." >&2
           exit 1
+
+  no-attribution:
+    if: inputs.run-no-attribution
+    # Stable required-status-check context (governance/rulesets/main.json gates on
+    # it; see governance/STANDARDS.md §4). Do NOT rename without updating both.
+    name: no-attribution
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Full history so the PR commit range (base..head) resolves — the leg
+          # scans EVERY commit message in that range, not just the tip.
+          fetch-depth: 0
+      - name: Reject AI/LLM self-attribution in commits + PR title/body
+        shell: bash
+        # ONE detector: the tc-fitness `no_llm_attribution` scan the local
+        # commit-msg strip hook (SGO-159) and the file-catalogue fitness rule also
+        # share, so the local hook, this CI leg, and the gate can never drift.
+        # `--scan-file` is READ-ONLY (CI must never rewrite history). The PR
+        # title/body + the engine ref reach the script ONLY as env values — never
+        # interpolated into this run body — injection-safe per the org standard
+        # (see the LICENSE / branch-naming legs above).
+        env:
+          TC_FITNESS_REF: ${{ inputs.no-attribution-fitness-ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          module="tc_fitness.core_checks.no_llm_attribution"
+          from="git+https://github.com/three-cubes/tc-fitness@${TC_FITNESS_REF}"
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "$workdir"' EXIT
+          rc=0
+
+          # Read-only residue scan of ONE text artifact. Never rewrites (no
+          # --strip-file). Records failure in $rc but keeps going, so the log
+          # lists every offending surface, not just the first.
+          scan() {
+            if ! uvx --from "$from" python -m "$module" --scan-file "$2"; then
+              echo "::error::no-attribution: AI/LLM self-attribution residue in $1." >&2
+              rc=1
+            fi
+          }
+
+          # (a) every commit message in the PR range (base..head). Fall back to
+          # HEAD's own message when there is no PR context (e.g. a push caller),
+          # so the reusable never hard-fails outside a pull_request.
+          if [[ -n "${PR_BASE_SHA:-}" && -n "${PR_HEAD_SHA:-}" ]]; then
+            shas="$(git rev-list "${PR_BASE_SHA}..${PR_HEAD_SHA}")"
+          else
+            shas="$(git rev-list -1 HEAD)"
+          fi
+          while IFS= read -r sha; do
+            [[ -z "$sha" ]] && continue
+            git log -1 --format=%B "$sha" > "$workdir/commit-${sha}.txt"
+            scan "commit ${sha} message" "$workdir/commit-${sha}.txt"
+          done <<< "$shas"
+
+          # (b) PR title and (c) PR body — env-bound, written verbatim so the
+          # detector (not the shell) interprets their content. Empty on a push
+          # caller, which scans clean.
+          printf '%s' "$PR_TITLE" > "$workdir/pr-title.txt"
+          scan "PR title" "$workdir/pr-title.txt"
+          printf '%s' "$PR_BODY" > "$workdir/pr-body.txt"
+          scan "PR body" "$workdir/pr-body.txt"
+
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error::no-attribution: remove the AI/LLM self-attribution" \
+              "flagged above. Agent work is authored by the canonical bot/human," \
+              "never advertised as model-generated (decision D1). The same" \
+              "detector runs in the local commit-msg strip hook — install it to" \
+              "catch this before push." >&2
+          fi
+          exit "$rc"
