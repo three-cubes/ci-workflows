@@ -18,3 +18,6 @@ jobs:
     with:
       yamllint-paths: ".github/workflows actions .github/actions"
       spdx-id: "Apache-2.0"
+      # Dogfood the D1 no-attribution leg on tc-pipelines' own PRs (default-on;
+      # set explicitly so the self-check exercises the leg it ships).
+      run-no-attribution: true

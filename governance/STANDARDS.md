@@ -43,6 +43,7 @@ Agents author PRs as a **dedicated GitHub App** (`three-cubes-agent`), never a h
 - **Autonomous on green** for ordinary work — a green gate auto-merges, no human, no admin bypass.
 - **HITL only on the control plane** — the gate's own definition (CI, `[tool.tc_fitness]`, schemas, validators, dep pins, governance) needs a human (`@three-cubes/maintainers`) via **CODEOWNERS**, so an agent can never weaken the gate that gates it.
 - **De-churned** — no forced up-to-date rebase, no stale-dismiss (see [`governance/rulesets/main.json`](rulesets/main.json) + [`governance/CODEOWNERS`](CODEOWNERS)).
+- **Clean authorship is CI-enforced, not convention** (decision D1) — the reusable gates ship a toggleable `no-attribution` leg (`meta-quality-gate.yml`, symmetric in `python-quality-gate.yml`; `run-no-attribution` input, default on) that rejects AI/LLM self-attribution residue in **every PR commit message and the PR title + body**, read-only (CI never rewrites history), via the single shared tc-fitness `no_llm_attribution` detector the local commit-msg strip hook and the fitness gate also use. It publishes the stable required-status-check context **`no-attribution`**; [`governance/rulesets/main.json`](rulesets/main.json) gates `main` on it. Renaming the leg's job means updating that context in lockstep.
 
 This model is **safe only because the gate is hard + fast** (§1–§2). Harden + verify a repo's gate before flipping it to autonomous.
 

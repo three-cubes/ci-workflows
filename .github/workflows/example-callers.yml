@@ -71,6 +71,8 @@ jobs:
       # taz-shaped: locked workspace install, the Node/TS half on (taz ships MCP
       # packages alongside the Python gate), its own coverage artifact name.
       sync-args: --locked --all-packages
+      # Exercise the D1 no-attribution message-scan leg's input shape statically.
+      run-no-attribution: true
       run-node: true
       pnpm-version: 10.27.0
       coverage-artifact-name: taz-coverage

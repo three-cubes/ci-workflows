@@ -59,6 +59,19 @@ on:
           `run --select lint,pytest` or `run --changed-only`.
         type: string
         default: "run"
+      run-no-attribution:
+        description: >-
+          Reject AI/LLM self-attribution residue in the PR's commit messages and
+          in the PR title + body (Autonomous Delivery Platform decision D1),
+          symmetric with the meta gate's leg. Uses the repo's ALREADY-installed
+          tc-fitness `no_llm_attribution` detector in READ-ONLY mode (`--scan-file`
+          — never rewrites history); the file-residue + canonical-identity range
+          checks stay owned by `tc-fitness run` via `[tool.tc_fitness]` config.
+          Full commit-range coverage needs `fetch-depth: 0` (as the engine's
+          range/secret-scan checks already do); otherwise only the tip commit +
+          title/body are scanned.
+        type: boolean
+        default: true
       pre-steps:
         description: >-
           Optional bash run before `tc-fitness run`, for repo-specific
@@ -169,6 +182,69 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.gh-token || github.token }}
         run: uv run tc-fitness ${{ inputs.tc-fitness-args }}
+
+      # ── No-attribution message scan (symmetric with the meta gate) ──────
+      # `tc-fitness run` above already scans in-repo FILES for attribution
+      # residue and gates commit IDENTITY over the range (both via the repo's
+      # [tool.tc_fitness] config). This step covers the surfaces that are NOT
+      # files: the PR's commit MESSAGES and the PR title/body — reusing the SAME
+      # already-installed `no_llm_attribution` detector in READ-ONLY mode
+      # (`--scan-file`, never rewrites). The PR title/body reach the script ONLY
+      # as env values — never interpolated into this run body — injection-safe.
+      - name: Reject AI/LLM self-attribution in commits + PR title/body
+        if: inputs.run-no-attribution
+        shell: bash
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          module="tc_fitness.core_checks.no_llm_attribution"
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "$workdir"' EXIT
+          rc=0
+
+          # Read-only residue scan of ONE text artifact via the repo's installed
+          # engine. Records failure but keeps going, so the log lists every
+          # offending surface, not just the first.
+          scan() {
+            if ! uv run python -m "$module" --scan-file "$2"; then
+              echo "::error::no-attribution: AI/LLM self-attribution residue in $1." >&2
+              rc=1
+            fi
+          }
+
+          # (a) every commit message in the PR range (base..head). When the range
+          # cannot resolve (shallow checkout — set fetch-depth: 0 for full
+          # coverage) or there is no PR context, fall back to HEAD's own message
+          # so historical commits are never re-litigated and pushes never fail.
+          shas=""
+          if [[ -n "${PR_BASE_SHA:-}" && -n "${PR_HEAD_SHA:-}" ]]; then
+            shas="$(git rev-list "${PR_BASE_SHA}..${PR_HEAD_SHA}" 2>/dev/null || true)"
+          fi
+          [[ -z "$shas" ]] && shas="$(git rev-list -1 HEAD)"
+          while IFS= read -r sha; do
+            [[ -z "$sha" ]] && continue
+            git log -1 --format=%B "$sha" > "$workdir/commit-${sha}.txt"
+            scan "commit ${sha} message" "$workdir/commit-${sha}.txt"
+          done <<< "$shas"
+
+          # (b) PR title and (c) PR body — env-bound, written verbatim so the
+          # detector (not the shell) interprets their content.
+          printf '%s' "$PR_TITLE" > "$workdir/pr-title.txt"
+          scan "PR title" "$workdir/pr-title.txt"
+          printf '%s' "$PR_BODY" > "$workdir/pr-body.txt"
+          scan "PR body" "$workdir/pr-body.txt"
+
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error::no-attribution: remove the AI/LLM self-attribution" \
+              "flagged above (decision D1). The same detector runs in the local" \
+              "commit-msg strip hook — install it to catch this before push." >&2
+          fi
+          exit "$rc"
 
       # ── TS coverage half (opt-in) ───────────────────────────────────────
       - name: TypeScript coverage
