@@ -234,3 +234,44 @@ jobs:
       draft: true
       ref: main
       fan-out-command: ""
+
+  # ── publish-pypi (HITL publish path — stays gated off) ─────────────────────
+  # Publishes to PyPI via Trusted Publishing (OIDC, no stored token). The real
+  # publish touches the release path and needs a registered trusted publisher +
+  # the target GitHub environment, so it MUST stay gated off in this self-check.
+  # No secret is wired: Trusted Publishing is secret-free by construction; the
+  # caller job grants `id-token: write` (widening the file's default
+  # `contents: read`) so the OIDC exchange shape is what a real consumer wires.
+  publish-pypi-kairix:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/publish-pypi.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      # kairix-shaped: long PyPI dist name, short import + console name, the
+      # release/release-alpha environment pair, an explicit tag ref.
+      dist-name: kairix-agentic-knowledge-mgt
+      import-name: kairix
+      console-script: kairix
+      stable-environment: release
+      alpha-environment: release-alpha
+      is-alpha: false
+      ref: v2026.5.10.6
+      python-version: "3.12"
+
+  publish-pypi-fitness:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/publish-pypi.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      # tc-fitness-shaped (candidate second consumer): dist-name `tc-fitness`
+      # imports as `tc_fitness`, a dispatch-driven alpha route, and the
+      # stable/alpha environment + python-version left on kairix-shaped defaults.
+      dist-name: tc-fitness
+      import-name: tc_fitness
+      console-script: tc-fitness
+      is-alpha: true
+      ref: v0.8.0
