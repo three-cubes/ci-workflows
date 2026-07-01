@@ -1,4 +1,4 @@
-# governance/loop/ — the autonomous-delivery loop guardrail harness (SP-C-1)
+# governance/loop/ — the autonomous-delivery loop: guardrail harness (SP-C-1) + dispatcher (SP-C-3)
 
 The machine-checkable half of the canonical spec
 [`../autonomous-loop.md`](../autonomous-loop.md) and its decision record
@@ -16,6 +16,40 @@ The machine-checkable half of the canonical spec
   `--reruns` / networked / unpinned-seed "pass" can never reach `done`); (4) ambiguous /
   consecutive-failure verification escalates; (5) the dispatch rate-limit backs off and recovers
   (transient backpressure, not a terminal failure).
+- [`loop_dispatcher.py`](loop_dispatcher.py) — the backlog **dispatcher** (SP-C-3 / PLA-311), the
+  "pull next issue" leg. It selects the next READY work item(s) from the *Autonomous Delivery
+  Platform* initiative and emits a **dispatch contract** the runtime consumes; it never spawns agents
+  and never writes to Linear. It (1) queries the Linear-adapter snapshot for `Backlog`, unblocked
+  candidates (an open `blocked-by` relation excludes an item, fail-closed); (2) orders them by the
+  `adp-wave-N` label → priority → age (the READY queue); (3) gates emission through the
+  `loop_state_machine` guardrail engine — `arm_auto_dispatch` must validate and every item passes the
+  per-issue + global budget / circuit-breaker checks, **refusing to emit if not armed**; (4) emits
+  each item as a `DispatchContract` (issue id, title, inferred repo, `<user>/<team>-<n>-<slug>`
+  branch, acceptance-criteria pointer). The Linear transport is an injected seam (`IssueSource`), so
+  selection/ordering/gating are testable offline and the same code runs live against Linear's GraphQL.
+- [`tests/test_loop_dispatcher.py`](tests/test_loop_dispatcher.py) — the dispatcher tests
+  (filtering, wave/priority/age ordering, the guardrail gate, repo/branch inference, the GraphQL
+  snapshot parser, and the CLI), all exercised offline with an injected Linear source.
+
+## Dispatcher CLI (`--dry-run` — the bootstrap-phase view)
+
+Print the READY queue + what WOULD be dispatched, with **zero side effects** — no agents spawned, no
+Linear writes. Run from `governance/loop/`:
+
+```sh
+# against a Linear-adapter snapshot (a list, or {"issues": [...]})
+python3 -m loop_dispatcher --dry-run --limit 3 --issues-file snapshot.json
+
+# against live Linear (stdlib urllib transport)
+LINEAR_API_KEY=lin_api_… python3 -m loop_dispatcher --dry-run
+
+# emit the machine dispatch contract instead of the human view
+python3 -m loop_dispatcher --json --limit 1 --issues-file snapshot.json
+```
+
+Repo inference precedence: a `repo:<name>` label → the `**Repos:**` line in the description → a
+`team-key → repo` fallback map. The dispatcher runs the guardrail harness in-process as its
+lights-out-gate proof before arming, so a red harness means it emits nothing.
 
 ## The lights-out gate
 
