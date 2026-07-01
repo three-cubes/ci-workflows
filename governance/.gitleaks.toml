@@ -1,0 +1,46 @@
+# .gitleaks.toml — three-cubes org allowlist template (SGO-186)
+#
+# Copy this to a consumer repo's ROOT as `.gitleaks.toml`. The security-scan
+# reusable (tc-pipelines/.github/workflows/security-scan.yml) passes it to the
+# gitleaks binary as --config so adoption does not drown the consumer in false
+# positives. It extends gitleaks' built-in ruleset and adds a PATH-pattern
+# allowlist for the file classes that are, by policy, safe to skip:
+# tests/fixtures (which contain fake tokens to prove scanners fire) and
+# dependency lockfiles (noisy, and covered by dependency scanners).
+#
+# This promotes the false-positive-handling model proven in tc-agent-zone
+# policy/security/vm-secret-allowlist.yml (path-pattern allowlist for
+# fixtures/lockfiles) into the CI-reusable convention. Keep entries NARROW:
+# prefer allowlisting a known-safe file CLASS over a broad directory, and put
+# individual accepted findings in the committed baseline
+# (.gitleaks-baseline.json), not here. See governance/security-scan.md.
+
+title = "three-cubes gitleaks config"
+
+[extend]
+# Inherit gitleaks' maintained default rules; this file only ADDS allowlists.
+useDefault = true
+
+[allowlist]
+description = "Org-wide path allowlist: test fixtures + dependency lockfiles."
+# Regexes matched against the file path of a candidate finding. A path that
+# matches any entry is not reported. Anchored on a path separator (or start)
+# so `tests/` matches `a/tests/x` and `tests/x` but not `contests/x`.
+paths = [
+  '''(^|/)tests?/''',
+  '''(^|/)test-fixtures?/''',
+  '''(^|/)fixtures?/''',
+  '''(^|/)__fixtures__/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)package-lock\.json$''',
+  '''(^|/)pnpm-lock\.yaml$''',
+  '''(^|/)yarn\.lock$''',
+  '''(^|/)uv\.lock$''',
+  '''(^|/)poetry\.lock$''',
+  '''(^|/)Cargo\.lock$''',
+  # The scan's own config + baseline files (they list detector examples /
+  # redacted fingerprints, never live secrets).
+  '''(^|/)\.gitleaks\.toml$''',
+  '''(^|/)\.gitleaks-baseline\.json$''',
+  '''(^|/)\.secrets\.baseline$''',
+]

@@ -1,0 +1,316 @@
+name: security-scan
+
+# Reusable (workflow_call) security scan for three-cubes repos — three
+# independently-toggleable legs, adoptable WITHOUT drowning a consumer in
+# false positives (SGO-186).
+#
+#   * gitleaks  — secret scan via the gitleaks BINARY in the free
+#                 `zricethezav/gitleaks` Docker image (NOT the org-licensed
+#                 gitleaks-action, which meters private repos). Full-history
+#                 scan on push/schedule; a redacted PR-DIFF scan on
+#                 pull_request so a consumer is never blocked by a pre-existing
+#                 finding they did not introduce. Honours a committed
+#                 `.gitleaks.toml` allowlist + a committed baseline.
+#   * semgrep   — SAST via `semgrep ci --oss-only` (OSS engine, NO
+#                 SEMGREP_APP_TOKEN) over the p/default+p/python+
+#                 p/github-actions+p/secrets rulesets. Blocking exit code on a
+#                 finding; emits SARIF.
+#   * codeql    — github/codeql-action init+analyze, GATED on a public-repo
+#                 signal (default derived from
+#                 github.event.repository.private == false) because
+#                 code-scanning SARIF upload is only free on public repos.
+#
+# Every leg's run: body is INJECTION-SAFE: each caller input and every piece of
+# event data (event name, PR base/head SHAs, repo visibility) is bound to an
+# env var first and never interpolated into a shell string, so a crafted PR
+# title / branch name / commit cannot break out of its context. Every
+# third-party action is SHA-pinned with a `# vX.Y.Z` comment, matching the
+# sibling reusables' pinning discipline; the gitleaks image + semgrep are
+# version-pinned inputs.
+#
+# The allowlist/baseline convention (path-pattern allowlist for
+# fixtures/lockfiles, committed baseline of accepted findings) ships as
+# governance/.gitleaks.toml + governance/gitleaks-baseline.template.json — see
+# governance/security-scan.md.
+#
+# Part of the Autonomous Delivery Platform roadmap (SGO-186) /
+# three-cubes/kairix#499 Phase 4 (org CI consolidation).
+
+on:
+  workflow_call:
+    inputs:
+      # ── Leg toggles (all default on) ────────────────────────────────────
+      run-gitleaks:
+        description: "Run the gitleaks secret-scan leg."
+        type: boolean
+        default: true
+      run-semgrep:
+        description: "Run the Semgrep OSS SAST leg."
+        type: boolean
+        default: true
+      run-codeql:
+        description: >-
+          Run the CodeQL leg. Also gated on the public-repo signal below —
+          CodeQL only runs where code-scanning SARIF upload is free.
+        type: boolean
+        default: true
+      # ── Checkout ────────────────────────────────────────────────────────
+      fetch-depth:
+        description: >-
+          Checkout fetch-depth. 0 = full history — required for the gitleaks
+          full-history scan and for resolving the PR base commit on the
+          pull_request diff scan. A shallow clone silently narrows both.
+        type: number
+        default: 0
+      # ── gitleaks surface ────────────────────────────────────────────────
+      gitleaks-image:
+        description: >-
+          Gitleaks Docker image WITHOUT the tag. Default is the free Docker Hub
+          image; consumers hitting Docker Hub rate limits can point this at
+          `ghcr.io/gitleaks/gitleaks`.
+        type: string
+        default: "zricethezav/gitleaks"
+      gitleaks-version:
+        description: "Gitleaks image tag (pinned). Overridable per consumer."
+        type: string
+        default: "v8.30.1"
+      gitleaks-config:
+        description: >-
+          Path (repo-relative) to the gitleaks config/allowlist. When present
+          it is passed as --config; when absent the scan runs on gitleaks'
+          built-in ruleset. See governance/.gitleaks.toml for the org template.
+        type: string
+        default: ".gitleaks.toml"
+      gitleaks-baseline:
+        description: >-
+          Path (repo-relative) to a committed gitleaks baseline of accepted
+          findings. When present it is passed as --baseline-path so known,
+          triaged findings do not re-block. Absent = no baseline.
+        type: string
+        default: ".gitleaks-baseline.json"
+      # ── Semgrep surface ─────────────────────────────────────────────────
+      semgrep-version:
+        description: "Semgrep version installed via pipx (pinned)."
+        type: string
+        default: "1.168.0"
+      semgrep-configs:
+        description: >-
+          Space-separated Semgrep config refs (registry packs or repo-relative
+          paths), each passed as a --config. Caller-controlled, never
+          event-derived.
+        type: string
+        default: "p/default p/python p/github-actions p/secrets"
+      semgrep-args:
+        description: >-
+          Extra arguments appended to `semgrep ci` (e.g. --exclude, --metrics
+          off, --max-target-bytes). Caller-controlled, never event-derived —
+          mirrors sonar-scan.yml's `args` passthrough.
+        type: string
+        default: ""
+      # ── CodeQL surface ──────────────────────────────────────────────────
+      codeql-languages:
+        description: >-
+          JSON array (as a string) of CodeQL languages, one analysis per entry
+          (e.g. '["python", "javascript"]'). Parsed with fromJSON into the job
+          matrix.
+        type: string
+        default: '["python"]'
+      # ── Public-repo gate + SARIF upload ─────────────────────────────────
+      assume-public:
+        description: >-
+          Force the repo to be treated as PUBLIC for the CodeQL leg and the
+          code-scanning SARIF-upload steps. Default false means the public
+          signal is DERIVED from github.event.repository.private == false, so
+          the gate is automatic; set true only where the event payload can't
+          carry repo visibility. It only ever ENABLES the public legs —
+          disable them with run-codeql / sarif-upload instead.
+        type: boolean
+        default: false
+      sarif-upload:
+        description: >-
+          Upload the gitleaks + Semgrep SARIF to GitHub code scanning (in
+          addition to the always-on build-artifact upload). Effective only on
+          public repos, where the upload is free — private repos still get the
+          SARIF as a workflow artifact.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ── gitleaks (secret scan) ────────────────────────────────────────────────
+  gitleaks:
+    if: inputs.run-gitleaks
+    name: gitleaks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # For the code-scanning SARIF upload (public repos only — the upload step
+      # is itself gated; the grant is harmless where the step is skipped).
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: ${{ inputs.fetch-depth }}
+          # The secret scan has no reason to persist the checkout token in
+          # .git/config; dropping it keeps the credential off the scanned tree.
+          persist-credentials: false
+
+      - name: Gitleaks scan
+        shell: bash
+        # Every value below is env-bound and never interpolated into the body —
+        # the PR base/head SHAs are hex from the event and cannot break the arg.
+        env:
+          GITLEAKS_IMAGE: ${{ inputs.gitleaks-image }}
+          GITLEAKS_VERSION: ${{ inputs.gitleaks-version }}
+          GITLEAKS_CONFIG: ${{ inputs.gitleaks-config }}
+          GITLEAKS_BASELINE: ${{ inputs.gitleaks-baseline }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # `detect` scans git history; --redact keeps any matched secret OUT
+          # of the logs and the SARIF; --exit-code 1 makes a finding a blocking
+          # failure. Paths are relative to the mounted /repo.
+          args=(detect --source /repo --redact --exit-code 1
+                --report-format sarif --report-path /repo/gitleaks.sarif)
+
+          # Honour a committed allowlist + baseline when present. Missing files
+          # are fine — the scan just runs without them.
+          if [[ -f "$GITLEAKS_CONFIG" ]]; then
+            args+=(--config "/repo/$GITLEAKS_CONFIG")
+          fi
+          if [[ -f "$GITLEAKS_BASELINE" ]]; then
+            args+=(--baseline-path "/repo/$GITLEAKS_BASELINE")
+          fi
+
+          # On pull_request, scan ONLY the PR's own commits (redacted PR-diff)
+          # so a consumer is not blocked by a pre-existing finding. On
+          # push/schedule, scan the FULL history.
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            args+=("--log-opts=--no-merges ${PR_BASE_SHA}..${PR_HEAD_SHA}")
+          fi
+
+          docker run --rm -v "${GITHUB_WORKSPACE}:/repo" \
+            "${GITLEAKS_IMAGE}:${GITLEAKS_VERSION}" "${args[@]}"
+
+      - name: Upload gitleaks SARIF (artifact)
+        if: ${{ always() && hashFiles('gitleaks.sarif') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gitleaks-sarif
+          path: gitleaks.sarif
+          if-no-files-found: ignore
+
+      - name: Upload gitleaks SARIF (code scanning)
+        # Public repos only — code-scanning upload is free there. Runs even
+        # when the scan failed (always()) so findings surface, and only when a
+        # SARIF was actually produced (hashFiles guard).
+        if: >-
+          ${{ always() && inputs.sarif-upload
+          && hashFiles('gitleaks.sarif') != ''
+          && (inputs.assume-public || github.event.repository.private == false) }}
+        uses: github/codeql-action/upload-sarif@8272c299f21ca24af15dfe9ac0971ba969e5e0d5 # v3.36.2
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+  # ── Semgrep OSS (SAST) ────────────────────────────────────────────────────
+  semgrep:
+    if: inputs.run-semgrep
+    name: semgrep
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: ${{ inputs.fetch-depth }}
+
+      - name: Run Semgrep OSS
+        shell: bash
+        env:
+          SEMGREP_VERSION: ${{ inputs.semgrep-version }}
+          SEMGREP_CONFIGS: ${{ inputs.semgrep-configs }}
+          SEMGREP_ARGS: ${{ inputs.semgrep-args }}
+        run: |
+          set -euo pipefail
+          pipx install "semgrep==${SEMGREP_VERSION}"
+
+          # Build the --config argv from the space-separated pack list.
+          config_args=()
+          # shellcheck disable=SC2086
+          # rationale: SEMGREP_CONFIGS is a deliberate space-separated list (a
+          # caller input); word-splitting it into separate --config args is
+          # intended, exactly like meta-quality-gate.yml splits YAMLLINT_PATHS.
+          for cfg in $SEMGREP_CONFIGS; do
+            config_args+=(--config "$cfg")
+          done
+
+          # `semgrep ci --oss-only`: OSS engine only, NO SEMGREP_APP_TOKEN, a
+          # blocking exit code on findings, SARIF emitted for the upload step.
+          # SEMGREP_ARGS is a caller-controlled passthrough (never event-data).
+          # shellcheck disable=SC2086
+          # rationale: SEMGREP_ARGS is an intentional caller-supplied arg list.
+          semgrep ci --oss-only "${config_args[@]}" \
+            --sarif --output semgrep.sarif $SEMGREP_ARGS
+
+      - name: Upload Semgrep SARIF (artifact)
+        if: ${{ always() && hashFiles('semgrep.sarif') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
+          if-no-files-found: ignore
+
+      - name: Upload Semgrep SARIF (code scanning)
+        if: >-
+          ${{ always() && inputs.sarif-upload
+          && hashFiles('semgrep.sarif') != ''
+          && (inputs.assume-public || github.event.repository.private == false) }}
+        uses: github/codeql-action/upload-sarif@8272c299f21ca24af15dfe9ac0971ba969e5e0d5 # v3.36.2
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  # ── CodeQL (public repos only) ────────────────────────────────────────────
+  # Gated on the public-repo signal: code-scanning SARIF upload — which the
+  # analyze step performs — is free only on public repos. On a private repo
+  # the whole job is skipped (gitleaks + Semgrep still run and hand back SARIF
+  # as a build artifact).
+  codeql:
+    if: >-
+      inputs.run-codeql
+      && (inputs.assume-public || github.event.repository.private == false)
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(inputs.codeql-languages) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@8272c299f21ca24af15dfe9ac0971ba969e5e0d5 # v3.36.2
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@8272c299f21ca24af15dfe9ac0971ba969e5e0d5 # v3.36.2
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@8272c299f21ca24af15dfe9ac0971ba969e5e0d5 # v3.36.2
+        with:
+          category: "/language:${{ matrix.language }}"

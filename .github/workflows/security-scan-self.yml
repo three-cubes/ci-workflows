@@ -1,0 +1,45 @@
+name: security-scan (self)
+
+# Real caller that EXERCISES the security-scan reusable at RUNTIME on this
+# repo's own PRs — the point SGO-186 calls out: a dispatch-gated example-caller
+# only validates the workflow_call contract STATICALLY (actionlint + the
+# reusable resolver), so a skipped reusable job never proves its jobs actually
+# start. This one does: tc-pipelines dogfoods its own reusable.
+#
+# Scope is deliberately kept green + fast for the meta repo's own inner loop:
+#   * gitleaks runs the REDACTED PR-DIFF scan (pull_request), so only this PR's
+#     own additions are scanned — never the full history (which would also
+#     never fire here, since this workflow has no push trigger).
+#   * Semgrep runs the low-false-positive p/secrets pack over the working tree.
+#   * CodeQL is OFF here (run-codeql: false): its workflow_call contract is
+#     validated statically in example-callers.yml and exercised for real when
+#     kairix (a code-heavy public repo) adopts the reusable. Keeping it off
+#     leaves the meta repo's PR loop lean.
+#
+# The full default Semgrep config set (p/default+p/python+p/github-actions+
+# p/secrets) and the CodeQL matrix are covered by the kairix-shaped +
+# taz-shaped static callers in example-callers.yml.
+#
+# Part of the Autonomous Delivery Platform roadmap (SGO-186).
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  security:
+    uses: ./.github/workflows/security-scan.yml
+    with:
+      fetch-depth: 0
+      # Dogfood the shipped org allowlist template as this repo's config.
+      gitleaks-config: governance/.gitleaks.toml
+      # ghcr mirror avoids anonymous Docker Hub pull limits in CI.
+      gitleaks-image: ghcr.io/gitleaks/gitleaks
+      gitleaks-version: v8.30.1
+      # Low-false-positive pack for the meta repo's own PR loop.
+      semgrep-configs: "p/secrets"
+      run-codeql: false

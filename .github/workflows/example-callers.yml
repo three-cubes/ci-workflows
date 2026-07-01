@@ -201,6 +201,37 @@ jobs:
       smoke-env-var-name: TAZ_IMAGE_TAG
       timeout-minutes: 30
 
+  # ── security-scan ──────────────────────────────────────────────────────────
+  # Static call-graph validation of the gitleaks + Semgrep OSS + CodeQL
+  # reusable. Both shapes exercise the full input contract; the RUNTIME
+  # exercise lives in security-scan-self.yml (which runs on this repo's PRs).
+  security-kairix:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/security-scan.yml
+    with:
+      # kairix-shaped: public repo, so CodeQL + code-scanning SARIF upload are
+      # on; full-history gitleaks with the default (Docker Hub) image, the full
+      # default Semgrep OSS config set, CodeQL over both shipped languages.
+      fetch-depth: 0
+      assume-public: true
+      codeql-languages: '["python", "javascript"]'
+
+  security-taz:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/security-scan.yml
+    with:
+      # taz-shaped: private today — assume-public stays default false, so the
+      # public signal auto-derives to false (repository.private == true);
+      # CodeQL is also explicitly off and gitleaks + Semgrep still run, handing
+      # SARIF back as build artifacts. ghcr image mirror, taz's own allowlist +
+      # detect-secrets-style baseline paths, the full default config set.
+      run-codeql: false
+      gitleaks-image: ghcr.io/gitleaks/gitleaks
+      gitleaks-version: v8.30.1
+      gitleaks-config: .gitleaks.toml
+      gitleaks-baseline: .secrets.baseline
+      semgrep-configs: "p/default p/python p/github-actions p/secrets"
+
   # ── release (HITL release path — stays gated off) ──────────────────────────
   release-kairix:
     if: ${{ inputs.run-for-real == 'true' }}
