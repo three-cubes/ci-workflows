@@ -162,12 +162,14 @@ Design notes: [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) · migration: [do
 
 ## Part 4 — Agent identity
 
-Agents act as a dedicated **GitHub App** (`three-cubes-agent`), not a person's account — so they open and prepare PRs that the quality check (and, for changes to the checks themselves, a human) then judges, with clean authorship and no shared personal credentials. The App's ID + private key live in `kv-tc-agents`; CI mints a short-lived installation token at runtime over WIF — no GitHub-stored secret.
+Agents act as a dedicated **GitHub App**, not a person's account — so they open and prepare PRs that the quality check (and, for changes to the checks themselves, a human) then judges, with clean authorship and no shared personal credentials. The App's ID + private key live in `kv-tc-agents`; CI mints a short-lived installation token at runtime over WIF — no GitHub-stored secret.
+
+The canonical org App is `three-cubes-agent`. **Per-agent Apps** (`tc-agent-builder`/`shape`/`consultant`/`growth`) give each agent its own least-privilege identity so the audit log shows *which* agent acted — the canonical set + the capability-vs-enforcement HITL model live in [`governance/agent-app-manifests/`](governance/agent-app-manifests/) + [`governance/agent-sdlc-access-and-hitl.md`](governance/agent-sdlc-access-and-hitl.md). Both mint surfaces below take a per-agent selector (`agent:` / `--agent`) resolving the `github-app-<agent>-{id,key}` vault secrets; omit it for `three-cubes-agent`.
 
 | Surface | Purpose |
 |---|---|
-| [`.github/actions/github-app-token`](.github/actions/github-app-token/action.yml) | **CI:** WIF → read the agent App creds from Key Vault → mint a short-lived installation token. Outputs `token` (+ `app-slug`, `installation-id`). |
-| [`tools/`](tools/) (`agent-token`) | **Off-CI / local / MCP agents:** installable console tool that mints the same App token from Key Vault via `az`. Imported by pinned `uvx`, not vendored per repo. |
+| [`.github/actions/github-app-token`](.github/actions/github-app-token/action.yml) | **CI:** WIF → read the agent App creds from Key Vault → mint a short-lived installation token. `agent:` selects a per-agent App. Outputs `token` (+ `app-slug`, `installation-id`). |
+| [`tools/`](tools/) (`agent-token`) | **Off-CI / local / MCP agents:** installable console tool that mints the same App token from Key Vault via `az`. `--agent` selects a per-agent App; `--git-config` sets the `[bot]` author on mint. Imported by pinned `uvx`, not vendored per repo. |
 
 ```bash
 # off-CI (local / MCP agent), so an agent raises PRs as the App, never a human:

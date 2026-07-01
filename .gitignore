@@ -1,2 +1,8 @@
 # Downloaded actionlint binary used for local workflow linting — never commit.
 actionlint
+
+# Python caches (tools/ package + its tests)
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/

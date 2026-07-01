@@ -1,0 +1,18 @@
+{
+  "name": "tc-agent-shape",
+  "description": "GitHub App identity for the Shape agent (chief-of-staff / orchestration). Coordinates work: opens + merges PRs, manages issues, reads CI + branch protection. No workflow/security/deploy write.",
+  "url": "https://github.com/three-cubes/tc-agent-zone",
+  "public": false,
+  "default_events": [],
+  "hook_attributes": { "active": false },
+  "default_permissions": {
+    "actions": "read",
+    "administration": "read",
+    "checks": "read",
+    "contents": "write",
+    "issues": "write",
+    "metadata": "read",
+    "pull_requests": "write",
+    "statuses": "read"
+  }
+}

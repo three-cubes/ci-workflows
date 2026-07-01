@@ -38,7 +38,7 @@ engine + reusables, then every repo converges up — nobody is down-levelled.
 
 ## 4. Merge governance (the model)
 
-Agents author PRs as a **dedicated GitHub App** (`three-cubes-agent`), never a human identity, so review is possible and attribution is clean. The merge model:
+Agents author PRs as a **dedicated GitHub App** — the canonical `three-cubes-agent`, or a **per-agent App** (`tc-agent-builder`/`shape`/`consultant`/`growth`) so the audit log shows *which* agent acted — never a human identity, so review is possible and attribution is clean. The capability-vs-enforcement model, the per-agent App set, and the token-mint surfaces are the [**Agent SDLC-access + HITL standard**](agent-sdlc-access-and-hitl.md) + [`agent-app-manifests/`](agent-app-manifests/). The merge model:
 
 - **Autonomous on green** for ordinary work — a green gate auto-merges, no human, no admin bypass.
 - **HITL only on the control plane** — the gate's own definition (CI, `[tool.tc_fitness]`, schemas, validators, dep pins, governance) needs a human (`@three-cubes/maintainers`) via **CODEOWNERS**, so an agent can never weaken the gate that gates it.

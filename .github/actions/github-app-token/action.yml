@@ -13,6 +13,11 @@ description: |
       the vault (defaults: github-threecubes-agent-app-id / -private-key).
     - Job permissions: id-token: write (WIF) and contents: read.
 
+  Per-agent Apps (SGO-163): set `agent: builder|shape|consultant|growth` to mint as
+  that agent's own App identity (reads github-app-<agent>-{id,key} from the vault).
+  Omit `agent` for the canonical three-cubes-agent App. See
+  governance/agent-sdlc-access-and-hitl.md.
+
   Usage (de-templated so the action.yml parser doesn't evaluate the docstring):
     permissions: { id-token: write, contents: read }
     steps:
@@ -22,6 +27,7 @@ description: |
           client-id:       {{ vars.AZURE_CLIENT_ID }}
           tenant-id:       {{ vars.AZURE_TENANT_ID }}
           subscription-id: {{ vars.AZURE_SUBSCRIPTION_ID }}
+          agent:           builder   # optional; omit for three-cubes-agent
       - run: gh pr create ...
         env: { GH_TOKEN: '{{ steps.app.outputs.token }}' }
 
@@ -39,12 +45,21 @@ inputs:
     description: Key Vault holding the agent App credentials.
     required: false
     default: kv-tc-agents
+  agent:
+    description: >-
+      Per-agent App selector (builder|shape|consultant|growth). When set, the
+      action reads github-app-<agent>-id / github-app-<agent>-key from the vault,
+      overriding app-id-secret / private-key-secret. Empty = the canonical
+      three-cubes-agent App (the app-id-secret / private-key-secret defaults).
+      See governance/agent-sdlc-access-and-hitl.md.
+    required: false
+    default: ''
   app-id-secret:
-    description: Key Vault secret name for the agent App ID.
+    description: Key Vault secret name for the agent App ID (used when `agent` is empty).
     required: false
     default: github-threecubes-agent-app-id
   private-key-secret:
-    description: Key Vault secret name for the agent App private key (.pem).
+    description: Key Vault secret name for the agent App private key (.pem) (used when `agent` is empty).
     required: false
     default: github-threecubes-agent-private-key
   owner:
@@ -82,14 +97,30 @@ runs:
       shell: bash
       env:
         KV: ${{ inputs.key-vault-name }}
+        AGENT: ${{ inputs.agent }}
         APP_ID_SECRET: ${{ inputs.app-id-secret }}
         PK_SECRET: ${{ inputs.private-key-secret }}
       run: |
         set -euo pipefail
-        app_id="$(az keyvault secret show --vault-name "$KV" --name "$APP_ID_SECRET" --query value -o tsv)"
+        # Resolve which vault secrets hold this identity's App ID + private key.
+        # A per-agent selector maps to the github-app-<agent>-{id,key} contract
+        # (allowlisted — the value flows into an az arg, so fail fast on anything
+        # else); empty falls back to the canonical app-id-secret / private-key-secret.
+        case "${AGENT}" in
+          "")
+            app_id_secret="${APP_ID_SECRET}"
+            pk_secret="${PK_SECRET}" ;;
+          builder|shape|consultant|growth)
+            app_id_secret="github-app-${AGENT}-id"
+            pk_secret="github-app-${AGENT}-key" ;;
+          *)
+            echo "::error::github-app-token: unknown agent '${AGENT}' (expected builder|shape|consultant|growth, or empty for three-cubes-agent)"
+            exit 1 ;;
+        esac
+        app_id="$(az keyvault secret show --vault-name "$KV" --name "$app_id_secret" --query value -o tsv)"
         echo "::add-mask::${app_id}"
         echo "app-id=${app_id}" >> "$GITHUB_OUTPUT"
-        pem="$(az keyvault secret show --vault-name "$KV" --name "$PK_SECRET" --query value -o tsv)"
+        pem="$(az keyvault secret show --vault-name "$KV" --name "$pk_secret" --query value -o tsv)"
         # Mask every PEM line before it can surface in any later log.
         while IFS= read -r line; do
           [ -n "${line}" ] && echo "::add-mask::${line}"

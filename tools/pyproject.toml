@@ -4,15 +4,21 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tc-agent-tools"
-version = "0.1.0"
-description = "Off-CI local agent tooling for Three Cubes repos — mint a three-cubes-agent GitHub App token so a local/MCP agent acts as the App, not a human."
+version = "0.2.0"
+description = "Off-CI local agent tooling for Three Cubes repos — mint a per-agent GitHub App token so a local/MCP agent acts as the App, not a human."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["pyjwt[crypto]>=2,<3"]  # [crypto] -> cryptography, required for RS256 App JWTs
 
+[dependency-groups]
+test = ["pytest>=8,<9"]
+
 [project.scripts]
-# `agent-token` -> short-lived three-cubes-agent installation token on stdout.
+# `agent-token` -> short-lived per-agent App installation token on stdout.
 agent-token = "tc_agent_tools.agent_token:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["tc_agent_tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

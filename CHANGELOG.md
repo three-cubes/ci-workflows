@@ -10,6 +10,28 @@ for the consumer-facing `@vN` workflow/action references.
 
 ### Added
 
+- **Canonical per-agent GitHub App governance (SGO-163).** Promoted from
+  tc-agent-zone into `governance/`: the per-agent App set
+  [`governance/agent-app-manifests/`](governance/agent-app-manifests/)
+  (`tc-agent-builder`/`shape`/`consultant`/`growth`, tiered permissions with the
+  `Administration=read` / `Secrets=none` HITL boundary intact) and the
+  [`governance/agent-sdlc-access-and-hitl.md`](governance/agent-sdlc-access-and-hitl.md)
+  standard (capability vs enforcement). Indexed from `STANDARDS.md` §4 +
+  `governance/README.md`.
+
+### Changed
+
+- **`agent-token` CLI + `github-app-token` action are per-agent-parametrised
+  (SGO-163).** The CLI gains `--agent builder|shape|consultant|growth` (resolving
+  the `github-app-<agent>-{id,key}` vault secrets and discovering the installation
+  from the App JWT), a `--repo` installation scope, and `--git-config` (sets
+  `git user.name/email` to the App's `[bot]` identity on mint). The composite
+  action gains an allowlisted `agent:` input mapping to the same secret contract.
+  Both default to the canonical `three-cubes-agent` App when unset — backward
+  compatible with existing consumers. (`tc-agent-tools` → 0.2.0.)
+
+### Added
+
 - **`github-app-token` composite action** (`.github/actions/github-app-token`) —
   mints a short-lived GitHub App installation token for the `three-cubes-agent`
   App by reading its App ID + private key from `kv-tc-agents` over WIF, so agents
