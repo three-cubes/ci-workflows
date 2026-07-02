@@ -15,11 +15,16 @@ name: verify-and-close
 #   2. Runs the consumer's configurable POST-MERGE verification (`verify-command`
 #      — a smoke / E2E / deploy-verify script). This is the deterministic
 #      verification trigger; its green/red is the interim gate.
-#   3. On PASS: transitions the issue to Done via the Linear GraphQL API and
-#      posts a "verification-confirmed on <sha>" comment. This is the
+#   3. On PASS: HARVESTS-THEN-CLOSES (SP-C-6 · PLA-314; ADR-038 harvest-then-
+#      decay). BEFORE the Done transition it posts a structured, provenance-
+#      stamped **harvest** comment distilling what shipped (the merged PR
+#      title/body), the verification result, and the key decisions; the Done
+#      transition fires ONLY after that harvest is recorded. This is the
 #      delivery-management **close** verb (the update -> harvest -> close model
 #      from the delivery-management MCP server, PLA-232; harvest-then-decay per
-#      PLA-241/PLA-242) expressed against Linear.
+#      PLA-241/PLA-242) expressed against Linear. FAIL-CLOSED: if the harvest
+#      cannot be recorded, the issue is NOT closed — it stays open and is
+#      labelled `needs-harvest` (no close/teardown without a harvest).
 #   4. On FAIL: moves the issue to a needs-fix state, adds a `needs-redispatch`
 #      label, and comments the failure log, so the backlog dispatcher picks it
 #      up — the failure is never silently dropped (SP-C failure-driven-next).
@@ -124,6 +129,14 @@ on:
           it. Created on the issue's team if it does not exist yet.
         type: string
         default: "needs-redispatch"
+      needs-harvest-label:
+        description: >-
+          Label added to the issue when a close is REFUSED because its harvest
+          artifact could not be recorded (SP-C-6 · PLA-314 · ADR-038). The issue
+          is left OPEN + labelled so a human can run the harvest, then close.
+          Created on the issue's team if it does not exist yet.
+        type: string
+        default: "needs-harvest"
       independent-verifier-verdict:
         description: >-
           SGO-169 SEAM (documented, currently-optional). The fresh-context
@@ -357,6 +370,102 @@ jobs:
           echo "outcome: verify=$VERIFY_OUTCOME," \
             "independent-verifier=$VERIFIER_VERDICT -> $result"
 
+      - name: Distill harvest artifact (ADR-038 harvest-then-decay — before close)
+        id: harvest
+        # Runs ONLY when we are about to CLOSE (verify pass + a resolved issue).
+        # Builds the structured HARVEST that MUST be recorded on the issue BEFORE
+        # the Done transition (SP-C-6 · PLA-314 — no close/teardown without a
+        # harvest): what shipped (the merged PR title/body), the verification
+        # result, and the key decisions. Pure text distillation — NO Linear key in
+        # this step. Every dynamic value (PR title/body, sha, verdicts) is
+        # env-bound and written to a file with printf '%s' (never interpolated
+        # into a runnable position); the file is injected into the Linear comment
+        # via jq --arg downstream, so nothing is spliced into a shell or GraphQL
+        # string (injection-safe per the org standard).
+        if: >-
+          steps.outcome.outputs.result == 'pass'
+          && steps.resolve.outputs.resolved == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_ID: ${{ steps.resolve.outputs.issue-id }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          PR_BODY_INPUT: ${{ inputs.pr-body }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          VERIFIER_VERDICT: ${{ steps.verifier.outputs.verdict }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Resolve the merged PR for this commit (title/body/number/url). The
+          # body may be overridden by the caller input (non-standard triggers).
+          pr_title=""; pr_body=""; pr_number=""; pr_url=""
+          if pr_json="$(gh api "repos/${GH_REPO}/commits/${SHA}/pulls" 2>/dev/null)"; then
+            pr_title="$(jq -r '.[0].title // ""' <<<"$pr_json")"
+            pr_number="$(jq -r '.[0].number // ""' <<<"$pr_json")"
+            pr_url="$(jq -r '.[0].html_url // ""' <<<"$pr_json")"
+            pr_body="$(jq -r '.[0].body // ""' <<<"$pr_json")"
+          else
+            echo "harvest: no PR found for ${SHA}; distilling from the sha alone."
+          fi
+          [[ -n "${PR_BODY_INPUT:-}" ]] && pr_body="$PR_BODY_INPUT"
+          [[ -n "$pr_title" ]] || pr_title="merged change on ${SHA}"
+
+          # Distil the change summary: the PR body with our own provenance HTML
+          # markers + any AI/LLM self-attribution footer stripped (D1 — the
+          # harvest comment must never re-introduce attribution), blank runs
+          # collapsed, and capped so the harvest stays a DISTILLATION not a copy.
+          # Deterministic, no network.
+          summary="$(printf '%s\n' "$pr_body" \
+            | sed -e 's/<!--.*-->//g' -e '/^[[:space:]]*Co-authored-by:/Id' -e '/🤖/d' \
+            | awk 'NF{blank=0} !NF{blank++} blank<2' \
+            | head -c 3500)"
+          [[ -n "${summary//[[:space:]]/}" ]] || summary="_(no PR description provided)_"
+
+          # Distil the key decisions: the section under a heading matching
+          # /decision/i (up to the next heading), else a pointer to the PR + ADRs.
+          decisions="$(printf '%s\n' "$pr_body" \
+            | awk '
+                /^#{1,6}[[:space:]].*[Dd]ecision/ { grab=1; next }
+                /^#{1,6}[[:space:]]/             { grab=0 }
+                grab                             { print }
+              ' \
+            | sed -e 's/<!--.*-->//g' \
+            | awk 'NF{blank=0} !NF{blank++} blank<2' \
+            | head -c 1500)"
+          [[ -n "${decisions//[[:space:]]/}" ]] \
+            || decisions="See merged PR${pr_number:+ #${pr_number}} and any ADRs it links."
+
+          verdict_line="deterministic post-merge verification ${VERIFY_OUTCOME}; independent-verifier verdict: ${VERIFIER_VERDICT:-pass}."
+
+          # Assemble the artifact. The trailing HTML marker is the canonical,
+          # provenance-stamped (issue-id) harvest key shared with
+          # governance/loop/harvest_gate.py — keep the format byte-identical.
+          out="${RUNNER_TEMP:-/tmp}/harvest.md"
+          {
+            printf '## Harvest — %s (ADR-038 harvest-then-decay)\n\n' "$ISSUE_ID"
+            printf '**Shipped:** %s' "$pr_title"
+            [[ -n "$pr_number" ]] && printf ' (#%s)' "$pr_number"
+            printf '\n\n**Change summary**\n\n%s\n\n' "$summary"
+            printf '**Verification:** PASS on %s — %s\n\n' "$SHA" "$verdict_line"
+            printf '**Key decisions**\n\n%s\n\n' "$decisions"
+            printf -- '---\n'
+            printf '_Provenance: issue=%s' "$ISSUE_ID"
+            [[ -n "$pr_number" ]] && printf ' · source-pr=#%s' "$pr_number"
+            [[ -n "$pr_url" ]] && printf ' · %s' "$pr_url"
+            printf ' · merged-sha=%s · run=%s._\n' "$SHA" "$RUN_URL"
+            printf '_Distilled harvest recorded BEFORE the Done transition '
+            printf '(SP-C-6 · PLA-314 — no close without a harvest)._\n'
+            printf '\n<!-- adp-harvest issue=%s -->\n' "$ISSUE_ID"
+          } > "$out"
+
+          {
+            echo "file=$out"
+            echo "marker=<!-- adp-harvest issue=${ISSUE_ID} -->"
+          } >> "$GITHUB_OUTPUT"
+          echo "harvest: distilled artifact for ${ISSUE_ID} -> $out ($(wc -c <"$out" | tr -d ' ') bytes)."
+
       - name: Azure login for Key Vault (WIF — optional secret-free path)
         # Only when the consumer opts into the KV-fetch path AND there is an
         # issue to transition. Federates to Azure via OIDC (no stored credential)
@@ -389,6 +498,9 @@ jobs:
           DONE_STATE: ${{ inputs.done-state }}
           NEEDS_FIX_STATE: ${{ inputs.needs-fix-state }}
           REDISPATCH_LABEL: ${{ inputs.needs-redispatch-label }}
+          NEEDS_HARVEST_LABEL: ${{ inputs.needs-harvest-label }}
+          HARVEST_FILE: ${{ steps.harvest.outputs.file }}
+          HARVEST_MARKER: ${{ steps.harvest.outputs.marker }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         shell: bash
         run: |
@@ -439,9 +551,12 @@ jobs:
 
           # Resolve the issue uuid + its team's states + labels in one round-trip.
           # Linear's `issue(id:)` accepts the human identifier (e.g. SGO-156).
+          # `comments` is fetched too so the harvest-present check is idempotent
+          # (a re-run detects an existing harvest artifact and never double-posts).
           # shellcheck disable=SC2016
           q_issue='query($id:String!){ issue(id:$id){ id identifier
             team{ id states{ nodes{ id name type } } labels{ nodes{ id name } } }
+            comments{ nodes{ body } }
           } }'
           issue_json="$(gql "$q_issue" "$(jq -n --arg id "$ISSUE_ID" '{id:$id}')")"
           uuid="$(jq -r '.data.issue.id // empty' <<<"$issue_json")"
@@ -487,6 +602,33 @@ jobs:
               '{id:$id,body:$body}')" >/dev/null
           }
 
+          # Find (or create on the issue's team) the named label, then add it to
+          # the issue. Shared by the FAIL redispatch path and the fail-closed
+          # needs-harvest path. Returns non-zero if the label can't be resolved.
+          add_named_label() {
+            local name="$1" lid team_id created
+            lid="$(jq -r --arg n "$name" '
+              .data.issue.team.labels.nodes
+              | (map(select(.name|ascii_downcase == ($n|ascii_downcase)))[0].id) // empty' \
+              <<<"$issue_json")"
+            if [[ -z "$lid" ]]; then
+              team_id="$(jq -r '.data.issue.team.id' <<<"$issue_json")"
+              # shellcheck disable=SC2016
+              local create='mutation($name:String!,$team:String!){
+                issueLabelCreate(input:{name:$name, teamId:$team}){
+                  success issueLabel{ id } } }'
+              created="$(gql "$create" "$(jq -n --arg name "$name" \
+                --arg team "$team_id" '{name:$name,team:$team}')")"
+              lid="$(jq -r '.data.issueLabelCreate.issueLabel.id // empty' <<<"$created")"
+            fi
+            [[ -n "$lid" ]] || return 1
+            # shellcheck disable=SC2016
+            local add='mutation($id:String!,$label:String!){
+              issueAddLabel(id:$id, labelId:$label){ success } }'
+            gql "$add" "$(jq -n --arg id "$uuid" --arg label "$lid" \
+              '{id:$id,label:$label}')" >/dev/null
+          }
+
           if [[ "$RESULT" == "pass" ]]; then
             # delivery-management CLOSE verb (update -> harvest -> close, PLA-232).
             sid="$(state_by_name_or_type "$DONE_STATE" completed)"
@@ -494,9 +636,49 @@ jobs:
               echo "::error::no '$DONE_STATE' (or completed-type) state on the issue's team." >&2
               exit 1
             fi
+
+            # === HARVEST-THEN-CLOSE (SP-C-6 · PLA-314 · ADR-038) ===
+            # No close/teardown without a harvest. Record the distilled harvest
+            # artifact BEFORE the Done transition; the close fires ONLY once it is
+            # recorded. Idempotent: if a harvest for this issue already exists
+            # (marker present), skip re-posting. FAIL-CLOSED: if the harvest can
+            # NOT be recorded, do not close — leave the issue OPEN + labelled.
+
+            # Guard: the distil step must have produced an artifact + a non-empty
+            # marker. If not, treat it as "no harvest" and fail-closed — never let
+            # an empty marker make the idempotency check match every comment.
+            if [[ -z "${HARVEST_MARKER:-}" || -z "${HARVEST_FILE:-}" || ! -s "$HARVEST_FILE" ]]; then
+              echo "::error::no distilled harvest artifact for ${ISSUE_ID}; refusing to" \
+                "close (ADR-038 / SP-C-6). Leaving the issue OPEN + labelled" \
+                "'${NEEDS_HARVEST_LABEL}'." >&2
+              add_named_label "$NEEDS_HARVEST_LABEL" \
+                || echo "::warning::could not resolve/create label '${NEEDS_HARVEST_LABEL}'." >&2
+              exit 1
+            fi
+
+            already="$(jq -r --arg m "$HARVEST_MARKER" '
+              [.data.issue.comments.nodes[]?.body // "" | select(contains($m))] | length' \
+              <<<"$issue_json")"
+            if [[ "${already:-0}" -gt 0 ]]; then
+              echo "harvest: existing harvest artifact found for ${ISSUE_ID} — idempotent skip."
+            else
+              harvest_body="$(cat "$HARVEST_FILE")"
+              if ! add_comment "$harvest_body"; then
+                # No harvest recorded => REFUSE to close (fail-closed). Leave the
+                # issue open and labelled so a human can harvest, then close.
+                echo "::error::harvest could NOT be recorded for ${ISSUE_ID}; refusing to" \
+                  "close (ADR-038 harvest-then-decay / SP-C-6). run the harvest first, then" \
+                  "close. Leaving the issue OPEN + labelled '${NEEDS_HARVEST_LABEL}'." >&2
+                add_named_label "$NEEDS_HARVEST_LABEL" \
+                  || echo "::warning::could not resolve/create label '${NEEDS_HARVEST_LABEL}'." >&2
+                exit 1
+              fi
+              echo "harvest: recorded distilled harvest artifact on ${ISSUE_ID} before close."
+            fi
+
             move_state "$sid"
-            add_comment "verification-confirmed on ${SHA}. Post-merge verification passed; delivery-management **close** applied (update -> harvest -> close, PLA-232) — Autonomous Delivery Platform / SP-C loop. Verification run: ${RUN_URL}"
-            echo "close: $ISSUE_ID -> '$DONE_STATE', confirmed on $SHA."
+            add_comment "verification-confirmed on ${SHA}. Post-merge verification passed; harvest recorded, then delivery-management **close** applied (update -> harvest -> close, PLA-232 / ADR-038 harvest-then-decay; SP-C-6 · PLA-314) — Autonomous Delivery Platform / SP-C loop. Verification run: ${RUN_URL}"
+            echo "close: $ISSUE_ID -> '$DONE_STATE', harvested + confirmed on $SHA."
           else
             # FAIL: needs-fix state + needs-redispatch label + failure log, so the
             # backlog dispatcher re-picks it (never silently dropped).
@@ -507,30 +689,10 @@ jobs:
             fi
             move_state "$sid"
 
-            # Find, or create on the team, the needs-redispatch label; then add it.
-            label_id="$(jq -r --arg n "$REDISPATCH_LABEL" '
-              .data.issue.team.labels.nodes
-              | (map(select(.name|ascii_downcase == ($n|ascii_downcase)))[0].id) // empty' \
-              <<<"$issue_json")"
-            if [[ -z "$label_id" ]]; then
-              team_id="$(jq -r '.data.issue.team.id' <<<"$issue_json")"
-              # shellcheck disable=SC2016
-              create='mutation($name:String!,$team:String!){
-                issueLabelCreate(input:{name:$name, teamId:$team}){
-                  success issueLabel{ id } } }'
-              created="$(gql "$create" "$(jq -n --arg name "$REDISPATCH_LABEL" \
-                --arg team "$team_id" '{name:$name,team:$team}')")"
-              label_id="$(jq -r '.data.issueLabelCreate.issueLabel.id // empty' <<<"$created")"
-            fi
-            if [[ -n "$label_id" ]]; then
-              # shellcheck disable=SC2016
-              add='mutation($id:String!,$label:String!){
-                issueAddLabel(id:$id, labelId:$label){ success } }'
-              gql "$add" "$(jq -n --arg id "$uuid" --arg label "$label_id" \
-                '{id:$id,label:$label}')" >/dev/null
-            else
-              echo "::warning::could not resolve/create label '$REDISPATCH_LABEL'." >&2
-            fi
+            # Find/create the needs-redispatch label on the team, then add it, so
+            # the backlog dispatcher re-queues the item.
+            add_named_label "$REDISPATCH_LABEL" \
+              || echo "::warning::could not resolve/create label '$REDISPATCH_LABEL'." >&2
 
             add_comment "post-merge verification FAILED on ${SHA}. Moved to '${NEEDS_FIX_STATE}' and labelled '${REDISPATCH_LABEL}' for the backlog dispatcher (SP-C failure-driven-next — not silently dropped). Full failure log: ${RUN_URL}"
             echo "needs-fix: $ISSUE_ID -> '$NEEDS_FIX_STATE' + '$REDISPATCH_LABEL' (log $RUN_URL)."
