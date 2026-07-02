@@ -340,10 +340,17 @@ def slugify(text: str, *, max_len: int = 48) -> str:
     return slug
 
 
+def _repo_from_repos_line(description: str) -> Optional[str]:
+    """The repo named on the ``**Repos:** <name>`` line, or ``None`` if absent."""
+    m = _REPOS_LINE_RE.search(description or "")
+    return m.group(1) if m else None
+
+
 def infer_repo(
     issue: CandidateIssue,
     *,
     team_repo_map: Optional[dict[str, str]] = None,
+    description_resolver: Optional[Callable[["CandidateIssue"], str]] = None,
 ) -> str:
     """Infer the target repo for an issue (PLA-311: "infer from team/labels").
 
@@ -351,8 +358,20 @@ def infer_repo(
 
     1. an explicit ``repo:<name>`` label;
     2. the ``**Repos:** <name>`` line in the description (the author's own
-       statement — the first-named repo is the primary target);
+       statement — the first-named repo is the primary target). The candidate's
+       own (possibly truncated) description is tried first; if it carries no
+       ``**Repos:**`` line and a ``description_resolver`` is supplied, the FULL
+       description is fetched (``get_issue``, NOT the truncated bulk
+       ``list_issues``) and re-parsed;
     3. the ``team-key → repo`` map (last resort).
+
+    The resolver step exists because the live dry-run mis-resolved an SGO issue
+    to ``tc-agent-zone`` via the team-key fallback: the bulk ``list_issues``
+    descriptions were truncated *before* the ``**Repos:**`` line, so the author's
+    real target (e.g. ``tc-fitness``) was invisible. Fetching the full
+    description recovers it. The resolver is only invoked when neither the label
+    nor the local description resolves — so an explicit label or an untruncated
+    ``**Repos:**`` line never pays for a network round-trip.
 
     Returns ``"unknown"`` if nothing resolves, so the contract never silently
     invents a repo.
@@ -361,15 +380,23 @@ def infer_repo(
         team_repo_map if team_repo_map is not None else DEFAULT_TEAM_REPO_MAP
     )
 
+    # 1. explicit repo:<name> label — the most authoritative signal, no fetch.
     for lbl in issue.labels:
         m = _REPO_LABEL_RE.match(lbl)
         if m:
             return m.group(1)
 
-    m = _REPOS_LINE_RE.search(issue.description)
-    if m:
-        return m.group(1)
+    # 2. the **Repos:** line — local (maybe-truncated) description first, then,
+    #    only if it has none, the FULL description via the injected resolver.
+    repo = _repo_from_repos_line(issue.description)
+    if repo:
+        return repo
+    if description_resolver is not None:
+        repo = _repo_from_repos_line(description_resolver(issue))
+        if repo:
+            return repo
 
+    # 3. team-key → repo map (last resort).
     return team_repo_map.get(issue.team_key, "unknown")
 
 
@@ -445,6 +472,18 @@ class IssueSource(Protocol):
     def fetch(self, initiative_id: str) -> list[CandidateIssue]: ...
 
 
+class DescriptionSource(Protocol):
+    """Optional capability a source may expose: fetch an issue's FULL description
+    on demand (``get_issue``, not the truncated bulk list).
+
+    A source that implements this lets the dispatcher recover a ``**Repos:**``
+    line that the bulk ``list_issues`` snapshot truncated away, so repo
+    resolution never mis-falls-through to the team-key map for want of a byte.
+    """
+
+    def fetch_description(self, identifier: str) -> str: ...
+
+
 @dataclass
 class StaticIssueSource:
     """An in-memory source — the primary fixture seam for the unit tests."""
@@ -488,6 +527,17 @@ class HttpLinearSource:
     def fetch(self, initiative_id: str) -> list[CandidateIssue]:
         payload = self._post(INITIATIVE_ISSUES_QUERY, {"id": initiative_id})
         return parse_initiative_issues(payload)
+
+    def fetch_description(self, identifier: str) -> str:
+        """The issue's FULL description (``get_issue``, never truncated).
+
+        Repo resolution calls this lazily, only for a selected READY item whose
+        candidate-list description carried no ``**Repos:**`` line, to recover the
+        author's real target before falling back to the team-key map. Linear's
+        ``issue(id:)`` resolves the human identifier (e.g. ``"SGO-198"``).
+        """
+        payload = self._post(ISSUE_DESCRIPTION_QUERY, {"id": identifier})
+        return parse_issue_description(payload)
 
     def _post(self, query: str, variables: dict) -> dict:
         body = json.dumps({"query": query, "variables": variables}).encode("utf-8")
@@ -587,9 +637,51 @@ def parse_initiative_issues(payload: dict) -> list[CandidateIssue]:
     return out
 
 
+#: GraphQL: one issue's FULL, untruncated description — the ``get_issue`` seam
+#: repo resolution falls back to when the bulk candidate list truncated the
+#: ``**Repos:**`` line. ``$id`` is the Linear identifier (e.g. ``"SGO-198"``).
+ISSUE_DESCRIPTION_QUERY = """
+query IssueDescription($id: String!) {
+  issue(id: $id) {
+    identifier
+    description
+  }
+}
+""".strip()
+
+
+def parse_issue_description(payload: dict) -> str:
+    """Parse the :data:`ISSUE_DESCRIPTION_QUERY` response to the raw description.
+
+    Pure — no network. Returns ``""`` for a missing issue (so resolution simply
+    falls through to the team-key map) and raises on GraphQL errors (a real
+    transport fault must not masquerade as an empty description).
+    """
+    if payload.get("errors"):
+        raise ValueError(f"Linear GraphQL errors: {payload['errors']}")
+    issue = (payload.get("data") or {}).get("issue") or {}
+    return str(issue.get("description") or "")
+
+
 # --------------------------------------------------------------------------- #
 # The dispatcher
 # --------------------------------------------------------------------------- #
+def _resolve_description_resolver(
+    source: object,
+    explicit: Optional[Callable[[CandidateIssue], str]],
+) -> Optional[Callable[[CandidateIssue], str]]:
+    """Pick the full-description resolver: an explicit callback wins; otherwise
+    adapt a source's :class:`DescriptionSource` ``fetch_description`` capability
+    (keyed by the issue identifier). ``None`` if neither is available — resolution
+    then stops at the local description + team-key map, exactly as before."""
+    if explicit is not None:
+        return explicit
+    fetch_description = getattr(source, "fetch_description", None)
+    if callable(fetch_description):
+        return lambda issue: fetch_description(issue.id)
+    return None
+
+
 class Dispatcher:
     """Selects, gates, and emits the next READY work-item(s) as contracts.
 
@@ -608,6 +700,7 @@ class Dispatcher:
         default_user: str = "dan",
         guardrails_validator: Callable[[], bool] = guardrails_validated,
         clock: Callable[[], float] = time.monotonic,
+        description_resolver: Optional[Callable[[CandidateIssue], str]] = None,
     ) -> None:
         self.source = source
         self.config = config or loop.GuardrailConfig()
@@ -617,6 +710,13 @@ class Dispatcher:
         self.default_user = default_user
         self.guardrails_validator = guardrails_validator
         self.clock = clock
+        # Repo resolution fetches a selected item's FULL description only when its
+        # candidate-list description carried no **Repos:** line (see infer_repo).
+        # Prefer an explicit resolver; else adapt a source that exposes the
+        # DescriptionSource capability (e.g. HttpLinearSource.fetch_description).
+        self.description_resolver = _resolve_description_resolver(
+            source, description_resolver
+        )
 
     def candidates(
         self, initiative_id: str = ADP_INITIATIVE_ID
@@ -633,7 +733,11 @@ class Dispatcher:
         return DispatchContract(
             issue_id=issue.id,
             title=issue.title,
-            repo=infer_repo(issue, team_repo_map=self.team_repo_map),
+            repo=infer_repo(
+                issue,
+                team_repo_map=self.team_repo_map,
+                description_resolver=self.description_resolver,
+            ),
             branch=branch_for(issue, default_user=self.default_user),
             acceptance_criteria=issue.url or f"linear:{issue.id}",
             wave=issue.wave,

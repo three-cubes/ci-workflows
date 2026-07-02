@@ -28,11 +28,13 @@ from loop_dispatcher import (  # noqa: E402
     CandidateIssue,
     Dispatcher,
     DispatchContract,
+    HttpLinearSource,
     JsonIssueSource,
     StaticIssueSource,
     branch_for,
     infer_repo,
     parse_initiative_issues,
+    parse_issue_description,
     ready_queue,
     slugify,
 )
@@ -74,6 +76,13 @@ def _armed_dispatcher(issues, **kw):
     validated by test_loop_guardrails; here we test the *gating*, not re-run it)."""
     kw.setdefault("guardrails_validator", lambda: True)
     return Dispatcher(StaticIssueSource(issues), **kw)
+
+
+def _armed_dispatcher_from_source(source, **kw):
+    """As :func:`_armed_dispatcher` but over an arbitrary (armed) source — used to
+    exercise a source that also exposes the ``fetch_description`` capability."""
+    kw.setdefault("guardrails_validator", lambda: True)
+    return Dispatcher(source, **kw)
 
 
 # --------------------------------------------------------------------------- #
@@ -189,6 +198,75 @@ class RepoInferenceTest(unittest.TestCase):
     def test_custom_team_map(self):
         issue = _issue(id="XYZ-1", description="", team_key="XYZ")
         self.assertEqual(infer_repo(issue, team_repo_map={"XYZ": "myrepo"}), "myrepo")
+
+
+# --------------------------------------------------------------------------- #
+# Repo resolution — full-description fetch fallback (the live dry-run caveat)
+#
+# The bulk list_issues descriptions are truncated: an SGO issue whose author
+# named tc-fitness on a **Repos:** line *below* the truncation point would
+# mis-resolve to tc-agent-zone via the team-key fallback. Fetching the FULL
+# description (get_issue) before the fallback recovers the real target.
+# --------------------------------------------------------------------------- #
+class RepoResolutionFetchTest(unittest.TestCase):
+    def test_repo_label_wins_without_fetching(self):
+        # The most explicit signal short-circuits BEFORE any full-description
+        # fetch — a repo:<name> label never pays for a network round-trip.
+        calls = []
+
+        def resolver(issue):
+            calls.append(issue.id)
+            return "**Repos:** tc-agent-zone"
+
+        issue = _issue(
+            id="SGO-1",
+            labels=("adp-wave-0", "repo:tc-fitness"),
+            description="",  # truncated in the bulk list — no Repos line
+        )
+        self.assertEqual(infer_repo(issue, description_resolver=resolver), "tc-fitness")
+        self.assertEqual(calls, [])  # label resolved it — resolver never called
+
+    def test_local_repos_line_short_circuits_fetch(self):
+        # An untruncated local **Repos:** line also resolves without a fetch.
+        calls = []
+
+        def resolver(issue):
+            calls.append(issue.id)
+            return "**Repos:** other-repo"
+
+        issue = _issue(id="SGO-3", description="**Repos:** tc-fitness")
+        self.assertEqual(infer_repo(issue, description_resolver=resolver), "tc-fitness")
+        self.assertEqual(calls, [])
+
+    def test_full_description_repos_line_beats_team_fallback(self):
+        # The regression: the candidate-list description was truncated past the
+        # **Repos:** line, so locally it resolves to the SGO->tc-agent-zone
+        # team fallback; fetching the FULL description recovers tc-fitness.
+        full = (
+            "Long lead-in that the bulk list_issues call truncated away ...\n\n"
+            "**Repos:** tc-fitness (worktree check) CORE"
+        )
+        issue = _issue(id="SGO-198", description="Long lead-in that the bulk")
+        self.assertEqual(infer_repo(issue), "tc-agent-zone")  # truncated → fallback
+        self.assertEqual(
+            infer_repo(issue, description_resolver=lambda i: full), "tc-fitness"
+        )
+
+    def test_fallback_only_when_neither_label_nor_repos_line(self):
+        # Full description ALSO carries no **Repos:** line and there is no label →
+        # the team-key map is the genuine last resort.
+        issue = _issue(id="SGO-2", description="truncated lead-in")
+        self.assertEqual(
+            infer_repo(issue, description_resolver=lambda i: "no repos line at all"),
+            "tc-agent-zone",
+        )
+
+    def test_unknown_when_nothing_resolves_even_with_fetch(self):
+        issue = _issue(id="ZZZ-9", description="", team_key="ZZZ")
+        self.assertEqual(
+            infer_repo(issue, description_resolver=lambda i: "still nothing"),
+            "unknown",
+        )
 
 
 class BranchInferenceTest(unittest.TestCase):
@@ -448,6 +526,109 @@ class ParseInitiativeTest(unittest.TestCase):
     def test_graphql_errors_raise(self):
         with self.assertRaises(ValueError):
             parse_initiative_issues({"errors": [{"message": "nope"}]})
+
+
+# --------------------------------------------------------------------------- #
+# Full-description resolution: parser + HttpLinearSource + Dispatcher wiring
+# --------------------------------------------------------------------------- #
+class _FakeResponse:
+    """A minimal context-manager stand-in for urllib's HTTP response."""
+
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class ParseIssueDescriptionTest(unittest.TestCase):
+    def test_parses_full_description(self):
+        issue = {"identifier": "SGO-198", "description": "**Repos:** tc-fitness"}
+        payload = {"data": {"issue": issue}}
+        self.assertEqual(parse_issue_description(payload), "**Repos:** tc-fitness")
+
+    def test_missing_issue_is_empty_string(self):
+        self.assertEqual(parse_issue_description({"data": {"issue": None}}), "")
+        self.assertEqual(parse_issue_description({}), "")
+
+    def test_null_description_is_empty_string(self):
+        self.assertEqual(
+            parse_issue_description({"data": {"issue": {"description": None}}}), ""
+        )
+
+    def test_graphql_errors_raise(self):
+        with self.assertRaises(ValueError):
+            parse_issue_description({"errors": [{"message": "nope"}]})
+
+
+class HttpSourceFetchDescriptionTest(unittest.TestCase):
+    def test_fetch_description_posts_identifier_and_parses(self):
+        captured = {}
+
+        def fake_opener(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            return _FakeResponse(
+                json.dumps(
+                    {"data": {"issue": {"description": "**Repos:** tc-fitness CORE"}}}
+                ).encode("utf-8")
+            )
+
+        src = HttpLinearSource("lin_api_x", opener=fake_opener)
+        desc = src.fetch_description("SGO-198")
+        self.assertEqual(desc, "**Repos:** tc-fitness CORE")
+        # The identifier is passed through as the GraphQL variable.
+        self.assertEqual(captured["body"]["variables"], {"id": "SGO-198"})
+        # ... and that description resolves to the right repo via infer_repo.
+        self.assertEqual(
+            infer_repo(_issue(id="SGO-198", description=""),
+                       description_resolver=lambda i: desc),
+            "tc-fitness",
+        )
+
+
+class DescriptionResolverWiringTest(unittest.TestCase):
+    def test_dispatcher_adapts_source_fetch_description(self):
+        # A source whose candidate list is truncated but which exposes
+        # fetch_description → the contract resolves via the FULL description,
+        # NOT the SGO->tc-agent-zone team fallback.
+        class TruncatingSource:
+            def __init__(self):
+                self.fetched = []
+
+            def fetch(self, initiative_id):
+                return [
+                    _issue(id="SGO-198", labels=("adp-wave-0",), description="lead-in")
+                ]
+
+            def fetch_description(self, identifier):
+                self.fetched.append(identifier)
+                return "**Repos:** tc-fitness (worktree check) CORE"
+
+        src = TruncatingSource()
+        plan = _armed_dispatcher_from_source(src).plan(limit=1)
+        self.assertEqual(plan.contracts[0].repo, "tc-fitness")
+        self.assertEqual(src.fetched, ["SGO-198"])  # fetched lazily, once
+
+    def test_explicit_resolver_wins_over_source(self):
+        issue = _issue(id="SGO-9", labels=("adp-wave-0",), description="lead-in")
+        d = _armed_dispatcher(
+            [issue], description_resolver=lambda i: "**Repos:** tc-fitness"
+        )
+        self.assertEqual(d.plan(limit=1).contracts[0].repo, "tc-fitness")
+
+    def test_no_resolver_falls_back_to_team_map(self):
+        # StaticIssueSource exposes no fetch_description → resolution stops at the
+        # local description + team-key map, exactly as before this change.
+        issue = _issue(id="SGO-9", labels=("adp-wave-0",), description="lead-in")
+        d = _armed_dispatcher([issue])
+        self.assertIsNone(d.description_resolver)
+        self.assertEqual(d.plan(limit=1).contracts[0].repo, "tc-agent-zone")
 
 
 # --------------------------------------------------------------------------- #
