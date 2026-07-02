@@ -30,6 +30,27 @@ The machine-checkable half of the canonical spec
 - [`tests/test_loop_dispatcher.py`](tests/test_loop_dispatcher.py) — the dispatcher tests
   (filtering, wave/priority/age ordering, the guardrail gate, repo/branch inference, the GraphQL
   snapshot parser, and the CLI), all exercised offline with an injected Linear source.
+- [`loop_governor.py`](loop_governor.py) — the **runtime governor** (SP-C-4 / PLA-312). Where the
+  harness proves each guardrail *can* fire, the governor is the runtime that *enforces* them during a
+  live loop: it wraps a `dispatch → verify → close` cycle and, on any breach, HALTS rather than
+  silently continuing, opening an escalation to the human-accountable assignee. It **consumes**
+  `loop_state_machine` directly — the same `GuardrailConfig` ceilings, `admit_verification`
+  determinism check, `arm_auto_dispatch` lights-out gate, and `GuardrailTripped` vocabulary — so the
+  runtime and the spec cannot drift. It records per-issue attempt/cost state (`IssueLedger`) and
+  exposes `should_continue()` / `record_attempt()` / `record_cost()` / `escalate()`; it **refuses to
+  run** unless armed. It enforces (1) the N-retry ceiling, (2) the per-issue budget cap, (3) the
+  global budget cap, (4) a cross-issue circuit-breaker (repeated failures *across* issues halt all
+  dispatch — a systemic red, distinct from the budget breaker), (5) determinism (a `--reruns` /
+  networked / unpinned-seed "pass" can never close — it escalates), and (6) ambiguous / repeated
+  failure → escalate. Escalation goes through an injected `EscalationSink` (the Linear adapter +
+  PushNotification in production; a recording fake in tests) **exactly once** per issue (idempotent);
+  budget counters are fed by `record_cost()` off the token-logger spend path (SGO-44).
+- [`tests/test_loop_governor.py`](tests/test_loop_governor.py) — the governor tests. They simulate
+  each failure mode against a governed cycle and assert the governor **halts/escalates** — the
+  never-greening issue escalates at the ceiling, the per-issue cap escalates that item, the global
+  cap and the cross-issue circuit-breaker halt the fleet, a non-deterministic "pass" never closes,
+  and an ambiguous verdict escalates — and that every escalation is emitted to the human **exactly
+  once** (idempotent). It also asserts the governor refuses to run until `arm_auto_dispatch` validated.
 
 ## Dispatcher CLI (`--dry-run` — the bootstrap-phase view)
 
