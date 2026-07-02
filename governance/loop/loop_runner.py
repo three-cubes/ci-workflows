@@ -272,6 +272,12 @@ class GitHubActionsDispatchSink:
     ref: str = "main"
     api_url: str = "https://api.github.com"
     transport: DispatchTransport = _default_dispatch_transport
+    # H1: auto-merge is STRICTLY OPT-IN. This is passed as the workflow's
+    # `enable-auto-merge` input; loop-implement.yml only auto-merges a product-repo
+    # PR when it is true. The caller (_build_sink) sets it True ONLY on the armed +
+    # live dispatch path, so a manually-triggered or logging dispatch never
+    # auto-merges. Default False keeps every other construction review-only.
+    enable_auto_merge: bool = False
 
     def _validate(self, contract: DispatchContract) -> None:
         """Reject anything outside the strict allowlist BEFORE it reaches a
@@ -298,6 +304,11 @@ class GitHubActionsDispatchSink:
                 "issue-id": contract.issue_id,
                 "issue-branch": contract.branch,
                 "repo": contract.repo,
+                # H1: workflow_dispatch inputs are strings; GitHub coerces the
+                # boolean input. Auto-merge stays opt-in — this is "true" only when
+                # the sink was built on the armed+live path (see _build_sink); the
+                # workflow itself also defaults it false for any other caller.
+                "enable-auto-merge": "true" if self.enable_auto_merge else "false",
             },
         }
         body = json.dumps(payload).encode("utf-8")
@@ -952,6 +963,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="GitHub REST API base. Env: GITHUB_API_URL (GHES override).",
     )
     parser.add_argument(
+        "--enable-auto-merge",
+        action="store_true",
+        default=os.environ.get("LOOP_ENABLE_AUTO_MERGE") == "true",
+        help="H1 opt-in: let the github-actions sink pass enable-auto-merge=true "
+        "to loop-implement.yml, so the executor MAY auto-merge a PRODUCT-repo PR "
+        "(core repos still take n+1 review). Honoured ONLY on the armed+live "
+        "dispatch path — loop-dispatch.yml passes it ONLY on the go-live tick; "
+        "without it (the default) every dispatched run opens a review PR. Env: "
+        "LOOP_ENABLE_AUTO_MERGE.",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Emit the run result as JSON instead of the human-readable view.",
@@ -1016,12 +1038,18 @@ def _build_sink(args: argparse.Namespace) -> DispatchSink:
                 "loop_runner: --sink github-actions requires --dispatch-repo "
                 "(the owner/name hosting loop-implement.yml)."
             )
+        # H1: auto-merge is opt-in AND only ever on the armed+live path. Even if
+        # --enable-auto-merge is passed, it does NOT propagate unless this is the
+        # armed live dispatch — belt-and-suspenders with the workflow's own FALSE
+        # default, so nothing but the go-live tick can ever set enable-auto-merge.
+        enable_auto_merge = bool(args.enable_auto_merge and args.armed and args.live)
         return GitHubActionsDispatchSink(
             token=token,
             repo=args.dispatch_repo,
             workflow=args.dispatch_workflow,
             ref=args.dispatch_ref,
             api_url=args.dispatch_api_url,
+            enable_auto_merge=enable_auto_merge,
         )
     return LoggingDispatchSink()
 

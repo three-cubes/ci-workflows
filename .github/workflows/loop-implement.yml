@@ -59,6 +59,22 @@ on:
           infers it from the work item; `unknown` is rejected.
         type: string
         required: true
+      enable-auto-merge:
+        # H1 — auto-merge is STRICTLY OPT-IN. INVARIANT: the executor may enable
+        # `gh pr merge --auto` ONLY when this is true AND the target is a product
+        # (non-core) repo. It defaults FALSE, so any caller that does NOT set it
+        # (a plain workflow_dispatch / trial / manual run) opens a REVIEW PR and
+        # NEVER auto-merges. The loop wires true ONLY on the armed+live+past-soak
+        # dispatch (via GitHubActionsDispatchSink → loop-dispatch.yml's go-live
+        # path), so lights-out behaviour is preserved while nothing else can
+        # trigger an auto-merge.
+        description: >-
+          Opt-in: permit auto-merge (product repos only). Default FALSE — only
+          the loop's armed+live+past-soak dispatch passes true; every other run
+          opens a review PR and never auto-merges.
+        type: boolean
+        required: false
+        default: false
   workflow_dispatch:
     inputs:
       issue-id:
@@ -73,6 +89,16 @@ on:
         description: "Target repo (bare name or owner/name); `unknown` is rejected."
         type: string
         required: true
+      enable-auto-merge:
+        # H1 — a MANUAL dispatch defaults this FALSE, so a trial/manual run opens
+        # a REVIEW PR and can never auto-merge. Only the loop's gated live path
+        # sets it true (see the workflow_call input above).
+        description: >-
+          Opt-in: permit auto-merge (product repos only). Default FALSE — a
+          manual run opens a review PR and never auto-merges.
+        type: boolean
+        required: false
+        default: false
 
 # Least privilege: id-token for the WIF federation (the secret-free KV reads +
 # App-token mint); contents:read is all this workflow's OWN GITHUB_TOKEN needs —
@@ -82,16 +108,30 @@ permissions:
   contents: read
   id-token: write
 
-# One implement run per issue at a time; never cancel an in-flight implement (a
-# spawned agent should finish or time out, not be torn off mid-commit).
+# H1b — GLOBAL executor concurrency ceiling. A SINGLE constant group serializes
+# EVERY loop-implement run repo-wide, so a burst of dispatches (or a mis-fire)
+# can never fan out into N parallel headless executors that would share the bot
+# App token and contend on the per-actor Linear/model quota. At most ONE executor
+# runs at a time; `cancel-in-progress: false` lets an in-flight run finish (never
+# torn off mid-commit) while any newer run queues. This full serialize is the
+# deliberately-conservative default for the PILOT; once trusted it can be WIDENED
+# to a per-repo ceiling (e.g. append the target repo to the group) to allow
+# one-executor-per-product-repo parallelism without a global fan-out.
 concurrency:
-  group: loop-implement-${{ inputs.issue-id }}
+  group: loop-implement-global
   cancel-in-progress: false
 
 jobs:
   implement:
     name: implement ${{ inputs.issue-id }}
     runs-on: ubuntu-latest
+    # Below the global ceiling, still one implement run per ISSUE at a time; never
+    # cancel an in-flight implement (a spawned agent should finish or time out,
+    # not be torn off mid-commit). This finer group also survives if the global
+    # ceiling above is later widened to per-repo.
+    concurrency:
+      group: loop-implement-${{ inputs.issue-id }}
+      cancel-in-progress: false
     # Hard ceiling on the whole job — a wedged executor cannot burn indefinitely.
     timeout-minutes: ${{ fromJSON(vars.LOOP_EXECUTOR_JOB_TIMEOUT_MIN || '60') }}
     steps:
@@ -105,6 +145,11 @@ jobs:
           ISSUE_BRANCH_IN: ${{ inputs.issue-branch }}
           REPO_IN: ${{ inputs.repo }}
           OWNER: ${{ github.repository_owner }}
+          # LOWER — the TARGET repo is inferred from attacker-influenceable Linear
+          # content (the issue body names the repo), so a strict charset is not
+          # enough: pin it to an EXPLICIT allowlist of known org repos. Overridable
+          # via repo var LOOP_ALLOWED_REPOS (space-separated bare names).
+          ALLOWED_REPOS: ${{ vars.LOOP_ALLOWED_REPOS || 'kairix kata tc-agent-zone tc-pipelines data-visualisation' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -129,6 +174,19 @@ jobs:
           fi
           target_owner="${target_repo%%/*}"
           target_name="${target_repo##*/}"
+          # LOWER — enforce the explicit org-repo allowlist HERE, before any App
+          # token is minted or the executor runs. A resolved target that is not a
+          # known org repo fails the job now — the attacker-influenceable repo name
+          # can only ever select an allowlisted repo.
+          allowed=false
+          for r in $ALLOWED_REPOS; do
+            if [[ "$target_name" == "$r" ]]; then allowed=true; fi
+          done
+          if [[ "$allowed" != "true" ]]; then
+            echo "::error::loop-implement: target repo '${target_name}' is not in the" \
+              "allowlist (LOOP_ALLOWED_REPOS='${ALLOWED_REPOS}') — refusing before minting any token"
+            exit 1
+          fi
           {
             echo "ISSUE_ID=${ISSUE_ID_IN}"
             echo "ISSUE_BRANCH=${ISSUE_BRANCH_IN}"
@@ -221,8 +279,12 @@ jobs:
           EXECUTOR_MAX_TURNS: ${{ vars.LOOP_EXECUTOR_MAX_TURNS || '80' }}
           EXECUTOR_TIMEOUT_MIN: ${{ vars.LOOP_EXECUTOR_TIMEOUT_MIN || '45' }}
           # Core repos require n+1 human review — NEVER auto-merged; everything
-          # else is a product repo where the executor enables auto-merge.
+          # else is a product repo where the executor MAY enable auto-merge.
           CORE_REPOS: ${{ vars.LOOP_CORE_REPOS || 'tc-pipelines tc-agent-zone' }}
+          # H1 — auto-merge opt-in flag. FALSE unless the caller explicitly set it
+          # (only the loop's armed+live+past-soak dispatch does); a plain/manual
+          # workflow_dispatch leaves it false → review PR, no auto-merge.
+          ENABLE_AUTO_MERGE: ${{ inputs.enable-auto-merge }}
         working-directory: target
         shell: bash
         run: |
@@ -245,11 +307,19 @@ jobs:
           git config user.email "295831460+three-cubes-agent[bot]@users.noreply.github.com"
           git checkout -B "$ISSUE_BRANCH"
 
-          # --- Is this a product repo (auto-merge) or a core repo (n+1 review)? ---
-          auto_merge=true
-          for core in $CORE_REPOS; do
-            if [[ "$TARGET_NAME" == "$core" ]]; then auto_merge=false; fi
-          done
+          # --- H1: auto-merge is STRICTLY OPT-IN. INVARIANT: it is enabled ONLY
+          #     when the caller explicitly passed enable-auto-merge=true (the loop's
+          #     armed+live+past-soak dispatch does; a plain/manual workflow_dispatch
+          #     defaults it FALSE) AND the target is a product (non-core) repo. So a
+          #     merely-dispatched or manual run opens a REVIEW PR and NEVER
+          #     auto-merges — only the gated loop path can. ---
+          auto_merge=false
+          if [[ "$ENABLE_AUTO_MERGE" == "true" ]]; then
+            auto_merge=true
+            for core in $CORE_REPOS; do
+              if [[ "$TARGET_NAME" == "$core" ]]; then auto_merge=false; fi
+            done
+          fi
 
           # --- The tightly-scoped executor prompt. The validated issue-id / branch
           #     / repo are the ONLY dynamic values, and they match a strict charset

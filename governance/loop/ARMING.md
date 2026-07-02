@@ -89,10 +89,46 @@ with the safe `LoggingDispatchSink` and zero blast radius.)
 | 3b | **Soak window configured** — `LOOP_SOAK_TICKS` set so the first N armed ticks stay record-only; the first armed cron tick never dispatches. | `LOOP_SOAK_TICKS` repo variable (default 3); the soak tests green. |
 | 4 | **A real `DispatchSink` chosen + wired** — SATISFIED: [`GitHubActionsDispatchSink`](loop_runner.py) is implemented and selected by [`loop-dispatch.yml`](../../.github/workflows/loop-dispatch.yml) on the go-live path, with its own review + tests, on top of 3a + 3b + fail-closed 2. | This PR: `GitHubActionsDispatchSink` + `loop-implement.yml`; `test_loop_runner.py` (`GitHubActionsDispatchSinkTest` + `RealSinkGatingTest`) and `test_loop_hardening.py` green. |
 | 4a | **The bot App is installed with the permissions the executor + dispatch need** — the `three-cubes-agent` App has `actions: write` on `tc-pipelines` (so the App-token-triggered `workflow_dispatch` actually runs `loop-implement.yml`), and `contents: write` + `pull-requests: write` on each TARGET product repo (so the executor can push its branch and open/auto-merge the PR). | The App's installation permissions; a manual `workflow_dispatch` of `loop-implement.yml` producing a real bot PR (precondition 1's end-to-end cycle). |
+| 5 | **Executor capability hardening (H2) — REQUIRED before continuous `LOOP_LIVE`.** See the prominent block immediately below. | The three containment controls (a)–(c) below are in place. |
 
 Preconditions 1–4a are met by this change. **Arming stays safe** because the two
 keys (`LOOP_ARMED` + `LOOP_LIVE`) and the soak are all still required before the
 real sink is ever reached — merging changes nothing until an operator acts.
+
+> ## ⛔ Before `LOOP_LIVE` for CONTINUOUS operation — executor capability hardening (REQUIRED, H2)
+>
+> The headless executor ([`loop-implement.yml`](../../.github/workflows/loop-implement.yml))
+> runs `claude -p` with `--dangerously-skip-permissions` on an ephemeral runner
+> that simultaneously holds **three live credentials** — the Linear workspace key,
+> the model-provider API key, and the bot App installation token. Today the only
+> thing keeping a prompt-injected or misbehaving executor inside its lane is
+> **prompt-level containment** (the "treat the Linear body as DATA" boundary in the
+> executor prompt) plus the input-allowlist and the auto-merge opt-in. Prompt-only
+> containment is adequate for a **single supervised trial** but NOT for lights-out
+> continuous operation. Before flipping `LOOP_LIVE` for continuous dispatch, ALL
+> THREE of these MUST be in place:
+>
+> 1. **(a) Short-lived, minimally-scoped Linear token** — issue the executor a
+>    per-run, least-privilege Linear token (read the one issue + comment on it),
+>    NOT the shared workspace key. The workspace key in every ephemeral runner is
+>    an over-broad standing capability; a short-lived scoped token bounds the blast
+>    radius to the one item.
+> 2. **(b) Restricted runner network egress** — constrain the executor runner's
+>    outbound network to the hosts it actually needs (the model API, the GitHub
+>    API, Key Vault, and the package registries the gate uses). Default-open egress
+>    on a runner holding three secrets is an exfiltration path an injected prompt
+>    could use; an egress allowlist closes it.
+> 3. **(c) Secret-scanning / push-protection on the executor's own PRs** — enable
+>    GitHub secret-scanning **push-protection** on every TARGET repo so a commit the
+>    executor pushes cannot leak a credential into a branch/PR (defence-in-depth
+>    behind the prompt's "never echo a secret" rule).
+>
+> **REQUIRED gate:** do NOT set `LOOP_LIVE=true` for continuous lights-out
+> operation until (a), (b), and (c) all hold. A single **supervised trial** with
+> `enable-auto-merge=false` (a manual `workflow_dispatch`, or one closely-watched
+> live tick — it opens a REVIEW PR and cannot auto-merge, per H1) is acceptable
+> WITHOUT (a)–(c), precisely because a human reviews the result before anything
+> merges. Continuous operation is not.
 
 ### The chosen spawn seam (precondition 4) — and the alternatives
 
@@ -289,9 +325,15 @@ before it uses them). It runs on `ubuntu-latest`; **NOTHING touches openclaw**.
 
 Per tick, one item. The workflow, in order:
 
-1. **Validates** `issue-id` / `issue-branch` / `repo` against strict allowlists
-   (rejecting the `unknown` sentinel) and resolves a bare repo name to
-   `owner/name` — injection-safe: env-bound, never interpolated raw.
+1. **Validates** `issue-id` / `issue-branch` / `repo` against strict charset
+   allowlists (rejecting the `unknown` sentinel) and resolves a bare repo name to
+   `owner/name` — injection-safe: env-bound, never interpolated raw. It then pins
+   the resolved TARGET repo to an **explicit org-repo allowlist**
+   (`LOOP_ALLOWED_REPOS`, default `kairix kata tc-agent-zone tc-pipelines
+   data-visualisation`) and FAILS the job — **before any App token is minted** —
+   if the target is not on it. The repo is inferred from attacker-influenceable
+   Linear content, so the allowlist is the boundary that stops it selecting an
+   arbitrary repo.
 2. **Federates to Azure (WIF)** — no stored credential — and reads the model key
    (`anthropic-api-key`) and Linear key (`ci-verify-and-close`) from Key Vault
    `kv-tc-agents`, masked the instant they are read and kept step-local (never an
@@ -303,8 +345,24 @@ Per tick, one item. The workflow, in order:
 4. **Checks out the target repo** on the issue branch and runs `claude -p`
    HEADLESS with a tightly-scoped executor prompt: read the item from Linear,
    implement only it, run the repo gate green, commit D1-clean (canonical bot
-   identity, ZERO AI attribution), open the bot PR, and enable auto-merge on
-   product repos (never on core repos — those keep n+1 human review per D3).
+   identity, ZERO AI attribution), and open the bot PR.
+
+**Auto-merge is STRICTLY OPT-IN (H1).** The executor enables `gh pr merge --auto`
+ONLY when the workflow input `enable-auto-merge=true` **AND** the target is a
+product (non-core) repo. That input defaults **FALSE**, so a plain/manual
+`workflow_dispatch` (a trial run) opens a **REVIEW PR and never auto-merges**. The
+loop passes `enable-auto-merge=true` on **one path only** — the armed + live +
+past-soak dispatch (`loop-dispatch.yml`'s go-live branch → `--enable-auto-merge`
+→ `GitHubActionsDispatchSink`) — so lights-out behaviour is preserved while
+nothing else can trigger an auto-merge. Core repos still never auto-merge (n+1
+human review per D3), even on the go-live path.
+
+**Global concurrency ceiling (H1b).** `loop-implement.yml` carries a single
+workflow-level `concurrency` group (`loop-implement-global`, `cancel-in-progress:
+false`) that serializes EVERY executor run repo-wide, so a burst of dispatches
+cannot fan out into N parallel executors contending on the bot token + per-actor
+quota. A finer per-issue group sits below it. This full serialize is the
+conservative PILOT default; it can be widened to a per-repo ceiling later.
 
 **Per-item bounds (cost/turn caps).** The executor is bounded three ways, all
 operator-overridable via repo variables:
@@ -317,6 +375,7 @@ operator-overridable via repo variables:
 | Model | `LOOP_EXECUTOR_MODEL` | `claude-opus-4-8` |
 | CLI version (pinned) | `LOOP_CLAUDE_CODE_VERSION` | `2.1.197` |
 | Core repos (never auto-merged) | `LOOP_CORE_REPOS` | `tc-pipelines tc-agent-zone` |
+| Target-repo allowlist (LOWER) | `LOOP_ALLOWED_REPOS` | `kairix kata tc-agent-zone tc-pipelines data-visualisation` |
 
 The prompt hard-forbids touching anything outside the one issue (other repos,
 other issues, branch-protection, secret exfiltration) and treats the Linear issue

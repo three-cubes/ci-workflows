@@ -526,6 +526,29 @@ class GitHubActionsDispatchSinkTest(unittest.TestCase):
         self.assertEqual(inputs["issue-branch"], contract.branch)
         self.assertEqual(inputs["repo"], contract.repo)
 
+    def test_dispatch_defaults_enable_auto_merge_false(self):
+        # H1: a sink built WITHOUT the opt-in sends enable-auto-merge="false", so
+        # the executor opens a review PR and never auto-merges.
+        fake = _FakeTransport()
+        sink = _gha_sink(fake)  # default enable_auto_merge=False
+        sink.dispatch(_contract_for(_issue(id="SGO-76", description="**Repos:** kairix")))
+        inputs = json.loads(fake.calls[0]["body"].decode())["inputs"]
+        self.assertEqual(inputs["enable-auto-merge"], "false")
+
+    def test_dispatch_passes_enable_auto_merge_true_when_opted_in(self):
+        # H1: the ONLY way enable-auto-merge="true" reaches the workflow is a sink
+        # explicitly built with the opt-in (the armed+live path — see _build_sink).
+        fake = _FakeTransport()
+        sink = GitHubActionsDispatchSink(
+            token="tok-abc", repo="three-cubes/tc-pipelines",
+            workflow="loop-implement.yml", ref="main",
+            api_url="https://api.github.com", transport=fake,
+            enable_auto_merge=True,
+        )
+        sink.dispatch(_contract_for(_issue(id="SGO-76", description="**Repos:** kairix")))
+        inputs = json.loads(fake.calls[0]["body"].decode())["inputs"]
+        self.assertEqual(inputs["enable-auto-merge"], "true")
+
     def test_dispatch_sends_bearer_token_and_api_headers(self):
         fake = _FakeTransport()
         sink = _gha_sink(fake, token="tok-XYZ")
@@ -578,6 +601,53 @@ class GitHubActionsDispatchSinkTest(unittest.TestCase):
 
     def test_satisfies_the_protocol(self):
         self.assertIsInstance(_gha_sink(_FakeTransport()), DispatchSink)
+
+
+# --------------------------------------------------------------------------- #
+# H1 — _build_sink enables auto-merge ONLY on the armed+live dispatch path.
+# --------------------------------------------------------------------------- #
+class BuildSinkAutoMergeTest(unittest.TestCase):
+    """The sink factory is the choke point for the auto-merge opt-in: even with
+    --enable-auto-merge passed, it must only propagate to the real sink when the
+    tick is armed AND live — belt-and-suspenders with the workflow default."""
+
+    def _sink_for(self, argv):
+        args = runner_mod.build_arg_parser().parse_args(argv)
+        return runner_mod._build_sink(args)
+
+    def test_armed_live_opt_in_enables_auto_merge(self):
+        with mock.patch.dict(os.environ, {"LOOP_DISPATCH_TOKEN": "tok"}, clear=False):
+            sink = self._sink_for([
+                "--sink", "github-actions",
+                "--dispatch-repo", "three-cubes/tc-pipelines",
+                "--armed", "--live", "--enable-auto-merge",
+            ])
+        self.assertIsInstance(sink, GitHubActionsDispatchSink)
+        self.assertTrue(sink.enable_auto_merge)
+
+    def test_opt_in_without_live_does_not_enable_auto_merge(self):
+        # --enable-auto-merge passed, but NOT live: must NOT propagate.
+        with mock.patch.dict(os.environ, {"LOOP_DISPATCH_TOKEN": "tok"}, clear=False):
+            sink = self._sink_for([
+                "--sink", "github-actions",
+                "--dispatch-repo", "three-cubes/tc-pipelines",
+                "--armed", "--enable-auto-merge",
+            ])
+        self.assertFalse(sink.enable_auto_merge)
+
+    def test_armed_live_without_opt_in_does_not_enable_auto_merge(self):
+        with mock.patch.dict(os.environ, {"LOOP_DISPATCH_TOKEN": "tok"}, clear=False):
+            sink = self._sink_for([
+                "--sink", "github-actions",
+                "--dispatch-repo", "three-cubes/tc-pipelines",
+                "--armed", "--live",
+            ])
+        self.assertFalse(sink.enable_auto_merge)
+
+    def test_logging_sink_never_carries_auto_merge(self):
+        # The default (safe) sink has no auto-merge concept; the flag is inert.
+        sink = self._sink_for(["--enable-auto-merge", "--armed", "--live"])
+        self.assertIsInstance(sink, LoggingDispatchSink)
 
 
 # --------------------------------------------------------------------------- #

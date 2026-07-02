@@ -246,7 +246,13 @@ jobs:
                 exit 1
               fi
               export LOOP_DISPATCH_TOKEN="$DISPATCH_TOKEN"
-              args+=(--sink github-actions --dispatch-repo "$DISPATCH_REPO")
+              # H1: the go-live path is the ONLY place auto-merge is enabled.
+              # --enable-auto-merge makes the REAL sink pass enable-auto-merge=true
+              # in the per-item loop-implement dispatch (product repos auto-merge;
+              # core repos still take n+1 review). Every other tick omits it, and a
+              # manual/trial dispatch of loop-implement defaults it false → review
+              # PR — so nothing but this armed+live+past-soak path can auto-merge.
+              args+=(--sink github-actions --dispatch-repo "$DISPATCH_REPO" --enable-auto-merge)
               sink="GitHubActionsDispatchSink -> loop-implement.yml on $DISPATCH_REPO"
             fi
           fi
