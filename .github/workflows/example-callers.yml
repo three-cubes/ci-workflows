@@ -366,3 +366,67 @@ jobs:
       fail-on-verify-failure: false
     secrets:
       LINEAR_API_KEY: dummy-not-a-real-key-shape-check-only
+
+  # ── event-dispatch (autonomous-delivery OPEN side — SP-C-2) ─────────────────
+  # The failure-driven open side of the delivery loop: a CI-red run or a PR
+  # review-comment -> annotate the linked Linear issue + EMIT the re-dispatch
+  # signal (needs-redispatch label + backlog state) for loop_dispatcher.py to
+  # re-pick. The shapes exercise the full workflow_call contract statically
+  # across BOTH key-provisioning paths and BOTH event kinds. The fallback secret
+  # is a clearly-dummy literal (the run-for-real gate keeps it from ever
+  # authenticating).
+  event-dispatch-kairix-kv:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/event-dispatch.yml
+    permissions:
+      contents: read
+      pull-requests: read
+      id-token: write # federate to Azure for the secret-free Key Vault fetch
+    with:
+      # kairix-shaped, secret-free (RECOMMENDED), CI-failure: a `workflow_run`
+      # trigger forwards the failing run's head branch + name + log url. NO
+      # `secrets:` block — the Linear key is fetched from Key Vault via WIF at
+      # run time; linear-key-secret-name defaults to `ci-verify-and-close`.
+      event-kind: ci-failure
+      branch-name: dan/pla-310-example-slug
+      failing-check: python-quality-gate
+      failure-log-url: https://github.com/three-cubes/kairix/actions/runs/1
+      linear-key-vault: ${{ vars.KAIRIX_KV_NAME }}
+      azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
+      azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
+      azure-subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+  event-dispatch-kairix-review:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/event-dispatch.yml
+    permissions:
+      contents: read
+      pull-requests: read
+    with:
+      # kairix-shaped, fallback secret path, REVIEW-COMMENT: an `issue_comment`
+      # trigger forwards only the PR number (the branch is read from the PR) +
+      # the comment body/author/url (env-bound, injection-safe).
+      event-kind: review-comment
+      pr-number: "42"
+      comment-author: some-reviewer
+      comment-url: https://github.com/three-cubes/kairix/pull/42#issuecomment-1
+      comment-body: please guard the empty-list branch before indexing
+    secrets:
+      LINEAR_API_KEY: dummy-not-a-real-key-shape-check-only
+
+  event-dispatch-taz:
+    if: ${{ inputs.run-for-real == 'true' }}
+    uses: ./.github/workflows/event-dispatch.yml
+    permissions:
+      contents: read
+      pull-requests: read
+    with:
+      # taz-shaped, fallback secret path, CI-failure with an explicit issue-id
+      # override + a first-actionable `fix:` line and its own redispatch label.
+      event-kind: ci-failure
+      issue-id: SGO-169
+      failing-check: mutation-gate
+      failure-summary: "survivor at adapter.py:88 — add a boundary test"
+      needs-redispatch-label: redispatch
+    secrets:
+      LINEAR_API_KEY: dummy-not-a-real-key-shape-check-only

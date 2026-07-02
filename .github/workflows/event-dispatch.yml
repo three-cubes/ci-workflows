@@ -1,0 +1,533 @@
+name: event-dispatch
+
+# Reusable (workflow_call) — the FAILURE-DRIVEN side of the Autonomous Delivery
+# loop (Autonomous Delivery Platform initiative · SP-C "Failure-Driven Loop" ·
+# Increment-3 "Shape-as-orchestrator + enforcing hooks" · decision D5: the loop
+# lives in committed GitHub-Actions event-dispatch). SP-C-2 · PLA-310.
+#
+# Where verify-and-close.yml (SP-C-3) is the DETERMINISTIC CLOSE side, this is
+# the EVENT-DRIVEN OPEN side: it turns a CI-red run or a PR review-comment into
+# the NEXT action, with no human re-prompt. A consumer wires a thin trigger
+# workflow (`on: workflow_run` conclusion=failure, or `on: issue_comment` /
+# `pull_request_review` on an agent PR) that `uses:` this reusable and forwards
+# the event fields as inputs. This reusable then, deterministically:
+#
+#   1. Resolves the linked Linear issue id from the PR's head branch (org
+#      convention `<user>/<team>-<number>-<slug>`, e.g. `dan/pla-310-...` =>
+#      PLA-310) — the branch is taken directly (workflow_run carries
+#      `head_branch`) or read from the PR for `pr-number` (an issue_comment
+#      carries only the PR number) — or, failing that, the PR body.
+#   2. Posts a STRUCTURED annotation onto that Linear issue: on CI-red the
+#      failing check name + failure-log link (+ an optional first-actionable
+#      `fix:` line); on a review-comment the comment author, thread link, and
+#      the comment body itself.
+#   3. Applies the `needs-redispatch` label and moves the issue to a needs-fix
+#      (backlog-type) state.
+#
+# That label + state IS the re-dispatch signal. It is consumed by the backlog
+# dispatcher (governance/loop/loop_dispatcher.py, whose CANDIDATE_STATE_TYPE is
+# `backlog`), which re-picks the issue on its next pass. This workflow EMITS the
+# signal only — it does NOT spawn an agent itself (agent dispatch + the
+# storm/dispatch-cap live on the dispatcher/SP-C-1 side). Emitting the signal is
+# idempotent: adding a label already present and moving to the current state are
+# both no-ops, so re-delivery of the same event re-asserts the same signal
+# rather than double-dispatching.
+#
+# Injection-safe per the org workflow standard: every caller-supplied input and
+# every `github.event.*` field (the review-comment body above all) is env-bound
+# before it reaches a shell body — never interpolated into a `run:` string — so
+# no value can break out of its string context. Dynamic values injected into
+# GraphQL go through `jq --arg` (JSON-encoded), never string-spliced into a
+# query. The Linear API key is scoped to ONLY the Linear step and never written
+# to a job or step output.
+#
+# Key provisioning — two paths (RECOMMENDED first), mirroring verify-and-close:
+#   * SECRET-FREE (recommended): set `linear-key-vault` to an Azure Key Vault
+#     name. The job federates to Azure via Workload Identity Federation (OIDC,
+#     no stored credential) and reads the key from Key Vault at run time inside
+#     the Linear step. The consumer stores NO GitHub secret. See the WIF login
+#     step + the `az keyvault secret show` fetch in the Annotate-Linear step.
+#   * FALLBACK: pass `secrets.LINEAR_API_KEY`. Used only when `linear-key-vault`
+#     is empty.
+#
+# Part of the Autonomous Delivery Platform initiative (SP-C · PLA-310).
+
+on:
+  workflow_call:
+    inputs:
+      event-kind:
+        description: >-
+          Which failure event drives this dispatch: `ci-failure` (a red CI run)
+          or `review-comment` (a new review comment on the agent PR). Selects
+          the shape of the structured Linear annotation. Matched
+          case-insensitively.
+        type: string
+        default: "ci-failure"
+      branch-name:
+        description: >-
+          The PR head branch used to resolve the linked Linear issue (org
+          convention `<user>/<team>-<number>-<slug>`). On a `workflow_run`
+          trigger pass `github.event.workflow_run.head_branch`; on a
+          `pull_request_review` trigger pass `github.event.pull_request.head.ref`.
+          Leave empty for an `issue_comment` trigger and pass `pr-number`
+          instead — the branch is then read from the PR.
+        type: string
+        default: ""
+      pr-number:
+        description: >-
+          The pull-request number. Used to read the head branch + body from the
+          PR when `branch-name` is empty (an `issue_comment` event carries only
+          the PR number). Requires `pull-requests: read` on the caller job.
+        type: string
+        default: ""
+      pr-body:
+        description: >-
+          Override the PR body scanned as the fallback issue-id source. Default
+          empty => read it from the PR for `pr-number` when needed.
+        type: string
+        default: ""
+      issue-id:
+        description: >-
+          Explicit Linear issue identifier (e.g. PLA-310) to annotate. Highest
+          precedence; skips branch/PR-body resolution when set.
+        type: string
+        default: ""
+      failing-check:
+        description: >-
+          CI-FAILURE shape: the name of the failing check / workflow (e.g.
+          `python-quality-gate`). Typically `github.event.workflow_run.name`.
+          Env-bound, never interpolated.
+        type: string
+        default: ""
+      failure-summary:
+        description: >-
+          CI-FAILURE shape (optional): a first-actionable `fix:` line to include
+          in the annotation (e.g. the first failing assertion). Env-bound. Left
+          empty when the consumer has no cheap summary to hand.
+        type: string
+        default: ""
+      failure-log-url:
+        description: >-
+          CI-FAILURE shape: URL of the failing run's log (e.g.
+          `github.event.workflow_run.html_url`). Defaults to THIS dispatch run's
+          URL when empty.
+        type: string
+        default: ""
+      comment-body:
+        description: >-
+          REVIEW-COMMENT shape: the review comment body to route back onto the
+          issue (e.g. `github.event.comment.body` or `github.event.review.body`).
+          Env-bound and injected into GraphQL via `jq --arg` — never
+          interpolated into a shell or query string.
+        type: string
+        default: ""
+      comment-url:
+        description: >-
+          REVIEW-COMMENT shape: permalink to the comment / review thread (e.g.
+          `github.event.comment.html_url`). Env-bound.
+        type: string
+        default: ""
+      comment-author:
+        description: >-
+          REVIEW-COMMENT shape: the login of the comment author (e.g.
+          `github.event.comment.user.login`). Recorded in the annotation.
+          Env-bound.
+        type: string
+        default: ""
+      needs-fix-state:
+        description: >-
+          Linear workflow-state NAME the issue moves to so the backlog
+          dispatcher re-picks it. Matched case-insensitively; falls back to the
+          team's first `backlog` then `unstarted` state. MUST resolve to a
+          backlog-type state for loop_dispatcher.py to re-pick it (its
+          CANDIDATE_STATE_TYPE is `backlog`).
+        type: string
+        default: "Backlog"
+      needs-redispatch-label:
+        description: >-
+          Label added to the issue so the backlog dispatcher re-queues it.
+          Created on the issue's team if it does not exist yet.
+        type: string
+        default: "needs-redispatch"
+      runs-on:
+        description: "Runner label for the event-dispatch job."
+        type: string
+        default: "ubuntu-latest"
+      linear-api-url:
+        description: "Linear GraphQL endpoint (override for testing/proxies)."
+        type: string
+        default: "https://api.linear.app/graphql"
+      linear-key-vault:
+        description: >-
+          RECOMMENDED secret-free path. When set to an Azure Key Vault NAME, the
+          Linear API key is fetched at run time from that vault via Workload
+          Identity Federation (OIDC) — the consumer stores NO GitHub secret. The
+          job federates to Azure with the azure-* inputs below, reads
+          `linear-key-secret-name`, masks it, and uses it ONLY for the Linear
+          GraphQL Authorization header. Requires `id-token: write` on the caller
+          job. Leave empty to fall back to secrets.LINEAR_API_KEY.
+        type: string
+        default: ""
+      linear-key-secret-name:
+        description: >-
+          Key Vault secret NAME holding the Linear API key, read when
+          linear-key-vault is set. Passed to `az keyvault secret show` via env
+          (never interpolated into the run body). Default is the org's shared
+          `ci-verify-and-close` secret (the same key the close side uses).
+        type: string
+        default: "ci-verify-and-close"
+      azure-client-id:
+        description: >-
+          User-assigned managed-identity client ID for the WIF login (typically
+          vars.AZURE_CLIENT_ID). Required only when linear-key-vault is set.
+        type: string
+        default: ""
+      azure-tenant-id:
+        description: >-
+          Azure AD tenant ID for the WIF login (typically vars.AZURE_TENANT_ID).
+          Required only when linear-key-vault is set.
+        type: string
+        default: ""
+      azure-subscription-id:
+        description: >-
+          Subscription ID for the WIF login (typically
+          vars.AZURE_SUBSCRIPTION_ID). Required only when linear-key-vault is set.
+        type: string
+        default: ""
+    secrets:
+      LINEAR_API_KEY:
+        description: >-
+          FALLBACK Linear API key, used ONLY when `linear-key-vault` is empty.
+          Applied verbatim as the `Authorization` header for the GraphQL
+          transition + comment (a personal/workspace API key, NO `Bearer` prefix
+          per the Linear API). Prefer the secret-free `linear-key-vault` path;
+          see governance/loop/event-dispatch.md for how a consumer wires either.
+        required: false
+
+# The reusable declares the least it needs; the effective grant is the
+# intersection with the caller job. `id-token: write` is the MAXIMUM the
+# reusable can hold — it is only exercised on the OPTIONAL Key Vault (WIF) path.
+# A consumer that passes secrets.LINEAR_API_KEY (no linear-key-vault) simply
+# does not grant id-token in its caller job, so the intersection drops it and
+# the WIF login step is skipped; a KV consumer grants it so the OIDC federation
+# can run. `pull-requests: read` lets the resolver read the PR (branch + body)
+# for `pr-number`.
+permissions:
+  contents: read
+  pull-requests: read
+  id-token: write
+
+jobs:
+  event-dispatch:
+    name: event-dispatch
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Resolve linked Linear issue id
+        id: resolve
+        # github.token + repository and the caller overrides reach the script
+        # ONLY as env values — never interpolated into the body — injection-safe
+        # per the org standard.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_ID_INPUT: ${{ inputs.issue-id }}
+          BRANCH_INPUT: ${{ inputs.branch-name }}
+          PR_NUMBER_INPUT: ${{ inputs.pr-number }}
+          PR_BODY_INPUT: ${{ inputs.pr-body }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          issue_id=""
+          branch=""
+          pr_body=""
+
+          # (1) explicit issue-id override wins outright.
+          if [[ -n "${ISSUE_ID_INPUT:-}" ]]; then
+            issue_id="$ISSUE_ID_INPUT"
+          fi
+
+          # (2) branch + body: caller overrides first, else read the PR for
+          #     pr-number (an issue_comment event carries only the PR number,
+          #     not the head branch).
+          [[ -n "${BRANCH_INPUT:-}" ]] && branch="$BRANCH_INPUT"
+          [[ -n "${PR_BODY_INPUT:-}" ]] && pr_body="$PR_BODY_INPUT"
+          if [[ -z "$branch" || -z "$pr_body" ]] \
+             && [[ -n "${PR_NUMBER_INPUT:-}" && -n "${GH_TOKEN:-}" ]]; then
+            if pr_json="$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER_INPUT}" 2>/dev/null)"; then
+              [[ -z "$branch" ]] && branch="$(jq -r '.head.ref // ""' <<<"$pr_json")"
+              [[ -z "$pr_body" ]] && pr_body="$(jq -r '.body // ""' <<<"$pr_json")"
+            else
+              echo "resolve: no PR #${PR_NUMBER_INPUT} found (or token lacks pull-requests:read)."
+            fi
+          fi
+
+          # (3) parse the issue id from the branch, org convention
+          #     <user>/<team>-<number>-<slug> => <TEAM>-<number>.
+          if [[ -z "$issue_id" && -n "$branch" ]]; then
+            rest="${branch#*/}"
+            if [[ "$rest" =~ ^([A-Za-z]+)-([0-9]+)(-|$) ]]; then
+              team="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:lower:]' '[:upper:]')"
+              issue_id="${team}-${BASH_REMATCH[2]}"
+            fi
+          fi
+
+          # (4) fallback: scan the PR body for an explicit Linear identifier.
+          if [[ -z "$issue_id" && -n "$pr_body" ]]; then
+            issue_id="$(grep -oE '[A-Z]{2,}-[0-9]+' <<<"$pr_body" | head -n1 || true)"
+          fi
+
+          resolved=false
+          [[ -n "$issue_id" ]] && resolved=true
+
+          {
+            echo "issue-id=$issue_id"
+            echo "resolved=$resolved"
+            echo "branch=$branch"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ "$resolved" == "true" ]]; then
+            echo "resolve: linked Linear issue = $issue_id (branch='$branch')"
+          else
+            echo "resolve: no Linear issue id resolvable from branch='$branch' or the PR body."
+          fi
+
+      - name: Normalise event kind
+        id: kind
+        # Fail fast on a bad event-kind regardless of whether an issue resolved,
+        # so a mis-wired consumer surfaces immediately. Emits a single safe token.
+        env:
+          EVENT_KIND: ${{ inputs.event-kind }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          kind="$(printf '%s' "${EVENT_KIND:-ci-failure}" \
+            | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          case "$kind" in
+            ci-failure|ci|failure|red)       kind="ci-failure" ;;
+            review-comment|review|comment)   kind="review-comment" ;;
+            *)
+              echo "::error::event-kind='${EVENT_KIND}' is not one of" \
+                "ci-failure | review-comment." >&2
+              exit 1 ;;
+          esac
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
+          echo "event-dispatch: event kind = $kind"
+
+      - name: Azure login for Key Vault (WIF — optional secret-free path)
+        # Only when the consumer opts into the KV-fetch path AND there is an
+        # issue to annotate. Federates to Azure via OIDC (no stored credential)
+        # so the Annotate-Linear step can read the key from Key Vault at run
+        # time. The azure-* inputs are typically vars.AZURE_CLIENT_ID /
+        # _TENANT_ID / _SUBSCRIPTION_ID on the caller. Requires `id-token: write`.
+        if: inputs.linear-key-vault != '' && steps.resolve.outputs.resolved == 'true'
+        uses: three-cubes/tc-pipelines/.github/actions/wif-azure-login@v1
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.azure-subscription-id }}
+
+      - name: Annotate Linear + emit re-dispatch signal
+        if: steps.resolve.outputs.resolved == 'true'
+        # The Linear API key is scoped to THIS step only — never in the
+        # environment of any other step and never written to a job/step output.
+        # On the secret-free path the key is fetched from Key Vault INSIDE this
+        # step (env-bound vault + name, then masked). Every dynamic value (the
+        # review-comment body above all) is env-bound and injected into GraphQL
+        # via `jq --arg` (JSON-encoded), so nothing is spliced into a query.
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          LINEAR_KEY_VAULT: ${{ inputs.linear-key-vault }}
+          LINEAR_KEY_SECRET_NAME: ${{ inputs.linear-key-secret-name }}
+          LINEAR_API_URL: ${{ inputs.linear-api-url }}
+          KIND: ${{ steps.kind.outputs.kind }}
+          ISSUE_ID: ${{ steps.resolve.outputs.issue-id }}
+          NEEDS_FIX_STATE: ${{ inputs.needs-fix-state }}
+          REDISPATCH_LABEL: ${{ inputs.needs-redispatch-label }}
+          FAILING_CHECK: ${{ inputs.failing-check }}
+          FAILURE_SUMMARY: ${{ inputs.failure-summary }}
+          FAILURE_LOG_URL: ${{ inputs.failure-log-url }}
+          COMMENT_BODY: ${{ inputs.comment-body }}
+          COMMENT_URL: ${{ inputs.comment-url }}
+          COMMENT_AUTHOR: ${{ inputs.comment-author }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          # NOTE: the GraphQL query/mutation strings below are single-quoted ON
+          # PURPOSE — their `$id`/`$state`/`$name`/`$team`/`$body`/`$label` are
+          # GraphQL variables bound via jq --arg, NOT shell expansions. Each is
+          # marked `# shellcheck disable=SC2016` at its site.
+          set -euo pipefail
+          api="${LINEAR_API_URL:-https://api.linear.app/graphql}"
+
+          # Resolve the Linear API key. Secret-free path (when linear-key-vault
+          # is set): fetch from Key Vault via the WIF session established above.
+          # Fallback path (vault empty): the caller-supplied secret. The vault +
+          # secret NAME are env-bound (never interpolated into this body —
+          # injection-safe), and the fetched value is masked immediately so it
+          # can never surface in logs. The key stays a local shell variable in
+          # THIS step — never a job or step output.
+          if [[ -n "${LINEAR_KEY_VAULT:-}" ]]; then
+            linear_key="$(az keyvault secret show \
+              --vault-name "$LINEAR_KEY_VAULT" \
+              --name "$LINEAR_KEY_SECRET_NAME" \
+              --query value -o tsv)"
+            echo "::add-mask::$linear_key"
+          else
+            linear_key="${LINEAR_API_KEY:-}"
+          fi
+          if [[ -z "$linear_key" ]]; then
+            echo "::error::no Linear API key available — set linear-key-vault" \
+              "(recommended, secret-free) or pass secrets.LINEAR_API_KEY." >&2
+            exit 1
+          fi
+
+          # Minimal GraphQL client. GraphQL-level errors return HTTP 200 with an
+          # `errors` array, so we check that (not just the HTTP status).
+          gql() {
+            local resp
+            resp="$(jq -n --arg q "$1" --argjson v "$2" '{query:$q,variables:$v}' \
+              | curl -sS -X POST "$api" \
+                  -H "Authorization: $linear_key" \
+                  -H "Content-Type: application/json" \
+                  --data @-)"
+            if [[ -z "$resp" ]] || jq -e '.errors' >/dev/null 2>&1 <<<"$resp"; then
+              echo "::error::Linear GraphQL call failed: ${resp:-<empty response>}" >&2
+              return 1
+            fi
+            printf '%s' "$resp"
+          }
+
+          # Resolve the issue uuid + its team's states + labels in one round-trip.
+          # Linear's `issue(id:)` accepts the human identifier (e.g. PLA-310).
+          # shellcheck disable=SC2016
+          q_issue='query($id:String!){ issue(id:$id){ id identifier
+            team{ id states{ nodes{ id name type } } labels{ nodes{ id name } } }
+          } }'
+          issue_json="$(gql "$q_issue" "$(jq -n --arg id "$ISSUE_ID" '{id:$id}')")"
+          uuid="$(jq -r '.data.issue.id // empty' <<<"$issue_json")"
+          if [[ -z "$uuid" ]]; then
+            echo "::error::Linear issue '$ISSUE_ID' not found via the API." >&2
+            exit 1
+          fi
+
+          state_by_name_or_type() {
+            # $1 = wanted name; $2.. = fallback type order
+            local wanted="$1"; shift
+            local id
+            id="$(jq -r --arg n "$wanted" '
+              .data.issue.team.states.nodes
+              | (map(select(.name|ascii_downcase == ($n|ascii_downcase)))[0].id) // empty' \
+              <<<"$issue_json")"
+            if [[ -z "$id" ]]; then
+              local t
+              for t in "$@"; do
+                id="$(jq -r --arg t "$t" '
+                  .data.issue.team.states.nodes
+                  | (map(select(.type == $t))[0].id) // empty' <<<"$issue_json")"
+                [[ -n "$id" ]] && break
+              done
+            fi
+            printf '%s' "$id"
+          }
+
+          move_state() {
+            local state_id="$1"
+            # shellcheck disable=SC2016
+            local m='mutation($id:String!,$state:String!){
+              issueUpdate(id:$id, input:{stateId:$state}){ success } }'
+            gql "$m" "$(jq -n --arg id "$uuid" --arg state "$state_id" \
+              '{id:$id,state:$state}')" >/dev/null
+          }
+
+          add_comment() {
+            # shellcheck disable=SC2016
+            local m='mutation($id:String!,$body:String!){
+              commentCreate(input:{issueId:$id, body:$body}){ success } }'
+            gql "$m" "$(jq -n --arg id "$uuid" --arg body "$1" \
+              '{id:$id,body:$body}')" >/dev/null
+          }
+
+          # Build the structured annotation from env values (never interpolated
+          # into GitHub-expression context; injected into GraphQL via jq --arg).
+          nl=$'\n'
+          if [[ "$KIND" == "review-comment" ]]; then
+            body="New review comment on this agent PR — routing back to address"
+            body+=" it (event-dispatch · SP-C failure-driven-next; not silently"
+            body+=" dropped).${nl}${nl}"
+            body+="- From: ${COMMENT_AUTHOR:-unknown}${nl}"
+            body+="- Thread: ${COMMENT_URL:-n/a}${nl}${nl}"
+            body+="> ${COMMENT_BODY:-<empty comment>}${nl}"
+          else
+            body="CI failed on this agent PR — routing back for an automatic fix"
+            body+=" (event-dispatch · SP-C failure-driven-next; not silently"
+            body+=" dropped).${nl}${nl}"
+            body+="- Failing check: ${FAILING_CHECK:-unknown}${nl}"
+            body+="- Failure log: ${FAILURE_LOG_URL:-$RUN_URL}${nl}"
+            if [[ -n "${FAILURE_SUMMARY:-}" ]]; then
+              body+="- fix: ${FAILURE_SUMMARY}${nl}"
+            fi
+          fi
+          body+="${nl}Moved to '${NEEDS_FIX_STATE}' and labelled"
+          body+=" '${REDISPATCH_LABEL}' so the backlog dispatcher"
+          body+=" (governance/loop/loop_dispatcher.py) re-picks it. This EMITS"
+          body+=" the re-dispatch signal (label + state) — it does not spawn an"
+          body+=" agent itself. Autonomous Delivery Platform / SP-C (PLA-310)."
+
+          # Move to a needs-fix state the backlog dispatcher re-picks (its
+          # CANDIDATE_STATE_TYPE is `backlog`); fall back backlog -> unstarted.
+          sid="$(state_by_name_or_type "$NEEDS_FIX_STATE" backlog unstarted)"
+          if [[ -z "$sid" ]]; then
+            echo "::error::no '$NEEDS_FIX_STATE' (or backlog/unstarted-type)" \
+              "state on the issue's team." >&2
+            exit 1
+          fi
+          move_state "$sid"
+
+          # Find, or create on the team, the needs-redispatch label; then add it.
+          # Adding a label already present is a no-op, so the emit is idempotent.
+          label_id="$(jq -r --arg n "$REDISPATCH_LABEL" '
+            .data.issue.team.labels.nodes
+            | (map(select(.name|ascii_downcase == ($n|ascii_downcase)))[0].id) // empty' \
+            <<<"$issue_json")"
+          if [[ -z "$label_id" ]]; then
+            team_id="$(jq -r '.data.issue.team.id' <<<"$issue_json")"
+            # shellcheck disable=SC2016
+            create='mutation($name:String!,$team:String!){
+              issueLabelCreate(input:{name:$name, teamId:$team}){
+                success issueLabel{ id } } }'
+            created="$(gql "$create" "$(jq -n --arg name "$REDISPATCH_LABEL" \
+              --arg team "$team_id" '{name:$name,team:$team}')")"
+            label_id="$(jq -r '.data.issueLabelCreate.issueLabel.id // empty' <<<"$created")"
+          fi
+          if [[ -n "$label_id" ]]; then
+            # shellcheck disable=SC2016
+            add='mutation($id:String!,$label:String!){
+              issueAddLabel(id:$id, labelId:$label){ success } }'
+            gql "$add" "$(jq -n --arg id "$uuid" --arg label "$label_id" \
+              '{id:$id,label:$label}')" >/dev/null
+          else
+            echo "::warning::could not resolve/create label '$REDISPATCH_LABEL'." >&2
+          fi
+
+          add_comment "$body"
+          echo "event-dispatch ($KIND): $ISSUE_ID annotated, moved to" \
+            "'$NEEDS_FIX_STATE' + '$REDISPATCH_LABEL' — re-dispatch signal emitted."
+
+      - name: Note unresolved issue (never mis-annotate)
+        if: steps.resolve.outputs.resolved != 'true'
+        env:
+          KIND: ${{ steps.kind.outputs.kind }}
+          BRANCH: ${{ steps.resolve.outputs.branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # With no resolvable Linear id we DO NOT guess an issue to touch —
+          # annotating the wrong issue is worse than a skip (mirrors the
+          # verify-and-close deterministic-fallback rule).
+          echo "::warning::event-dispatch (${KIND}): no Linear issue id resolved" \
+            "from branch='${BRANCH}' or the PR body — skipping the annotation +" \
+            "re-dispatch signal. fix: name the agent branch per the org" \
+            "convention <user>/<team>-<number>-<slug> (e.g. dan/pla-310-slug)," \
+            "or reference the issue id (e.g. PLA-310) in the PR body, or pass the" \
+            "issue-id input. next: re-run once the branch/PR carries the id."
