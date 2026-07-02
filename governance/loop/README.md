@@ -45,6 +45,20 @@ The machine-checkable half of the canonical spec
   failure → escalate. Escalation goes through an injected `EscalationSink` (the Linear adapter +
   PushNotification in production; a recording fake in tests) **exactly once** per issue (idempotent);
   budget counters are fed by `record_cost()` off the token-logger spend path (SGO-44).
+- [`harvest_gate.py`](harvest_gate.py) — the **harvest-present close-invariant** (SP-C-6 / PLA-314),
+  promoting ADR-038 (harvest-then-decay / harvest-before-destroy) into a CORE close-invariant: an ADP
+  issue may not sit in a terminal `done`/`completed` state without a distilled **harvest artifact**
+  recorded on it (*no close / teardown without a harvest*). It is the machine-checkable predicate half
+  of the invariant that [`../../.github/workflows/verify-and-close.yml`](../../.github/workflows/verify-and-close.yml)
+  enforces at run time (it distils + posts the harvest comment BEFORE the Done transition, fail-closed
+  if it cannot). `has_harvest` / `assert_closed_carries_harvest` are **provenance-stamped** (keyed on
+  the issue id) and **idempotent**, and key off the SAME `<!-- adp-harvest issue=… -->` marker the
+  workflow writes, so the spec, the workflow, and the check cannot drift. Stdlib only, no network.
+- [`tests/test_harvest_gate.py`](tests/test_harvest_gate.py) — the close-invariant harness. It encodes
+  the PLA-314 **sabotage test** (*force-close with no harvest is refused; close after a harvest
+  succeeds*) plus the provenance/idempotency properties of the predicate — a harvest stamped for
+  another issue never satisfies this one, an open issue is exempt (the gate fires only at the close
+  boundary), and duplicate harvests still read as present.
 - [`tests/test_loop_governor.py`](tests/test_loop_governor.py) — the governor tests. They simulate
   each failure mode against a governed cycle and assert the governor **halts/escalates** — the
   never-greening issue escalates at the ceiling, the per-issue cap escalates that item, the global

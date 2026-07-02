@@ -30,10 +30,14 @@ A consumer's **on-merge-to-main** workflow calls this reusable. It then, in orde
 2. **Runs the post-merge verification** (`verify-command`) with the repo checked
    out at the merged sha. This is the **deterministic verification trigger** —
    its exit code is the interim gate.
-3. **On PASS** — transitions the issue to `done-state` (default `Done`) via the
-   Linear GraphQL API and posts a `verification-confirmed on <sha>` comment. This
-   is the delivery-management **close** verb (`update -> harvest -> close`,
-   PLA-232) expressed against Linear.
+3. **On PASS** — **harvests, then closes** (SP-C-6 · PLA-314 · ADR-038
+   harvest-then-decay). **Before** the Done transition it distils + posts a
+   structured **harvest** comment (see [below](#harvest-before-close-sp-c-6--pla-314--adr-038)),
+   then transitions the issue to `done-state` (default `Done`) via the Linear
+   GraphQL API and posts a `verification-confirmed on <sha>` comment. This is the
+   delivery-management **close** verb (`update -> harvest -> close`, PLA-232)
+   expressed against Linear. **Fail-closed:** if the harvest cannot be recorded,
+   the issue is **not** closed — it stays open and is labelled `needs-harvest`.
 4. **On FAIL** — moves the issue to `needs-fix-state` (default `Todo`), adds the
    `needs-redispatch` label (created on the issue's team if absent), and comments
    the failure log (a link to the Actions run). The **backlog dispatcher** picks
@@ -60,6 +64,50 @@ Wire it via the `independent-verifier-verdict` input:
 Kept **advisory-until-proven**: a flaky REQUIRED verifier would manufacture agent
 loops, so the verifier stays a judgment input to this deterministic close — never
 a silent hard gate (`governance/gate-hardening.md`, Determinism).
+
+## Harvest before close (SP-C-6 · PLA-314 · ADR-038)
+
+**No close / teardown without a harvest.** ADR-038 (harvest-then-decay /
+harvest-before-destroy) is promoted here into a **CORE close-invariant**: an ADP
+issue can never transition to `done-state` until a distilled **harvest artifact**
+is recorded on it. The close side enforces this *structurally*, not by convention.
+
+On the PASS path, **before** the Done transition, the workflow:
+
+1. **Distils** the harvest (the `Distill harvest artifact` step) — env-bound and
+   injection-safe, no Linear key in scope. It sources the **merged PR title/body**
+   (resolved for the commit, or the `pr-body` override) plus the verification
+   result, and produces a structured comment: **what shipped** (PR title + a
+   distilled change summary, with any AI/LLM self-attribution stripped per D1),
+   the **verification result** (`PASS on <sha>` + the independent-verifier
+   verdict), and the **key decisions** (the `decision`-headed section of the PR
+   body, else a pointer to the PR + linked ADRs). It is stamped with a
+   provenance + idempotency marker, keyed on the issue id:
+
+   ```text
+   <!-- adp-harvest issue=<ISSUE-ID> -->
+   ```
+
+2. **Records** it on the issue (the `Update Linear` step) — **idempotent**: if a
+   harvest artifact for the issue already exists (marker present), it is not
+   re-posted; the close still proceeds.
+
+3. **Closes only then.** The Done transition fires **only after** the harvest is
+   on the issue.
+
+**Fail-closed.** If the harvest cannot be recorded (or no artifact was distilled),
+the workflow **refuses to close**: the issue is left **open** and labelled
+`needs-harvest-label` (default `needs-harvest`), and the run exits non-zero with an
+actionable *run-harvest-first* message. A close with no harvest is impossible — a
+missing harvest is surfaced, never silently dropped.
+
+The machine-checkable predicate half of this invariant lives next to the loop
+state machine: [`governance/loop/harvest_gate.py`](harvest_gate.py) — `has_harvest`
+/ `assert_closed_carries_harvest` (provenance-stamped, idempotent), with the
+sabotage test (*force-close with no harvest is refused; close after harvest
+succeeds*) in [`tests/test_harvest_gate.py`](tests/test_harvest_gate.py). The
+workflow marker and the predicate marker are **byte-identical**, so the workflow,
+the spec, and the check cannot drift.
 
 ## The Linear API key — two paths
 
@@ -167,6 +215,7 @@ Common overrides:
 | `done-state` | `Done` | your team's terminal state name |
 | `needs-fix-state` | `Todo` | the state the dispatcher re-picks from |
 | `needs-redispatch-label` | `needs-redispatch` | your dispatcher's queue label |
+| `needs-harvest-label` | `needs-harvest` | label applied when a close is refused for a missing harvest (SP-C-6) |
 | `independent-verifier-verdict` | `pass` | wire SGO-169's conclusion once adopted |
 | `fail-on-verify-failure` | `true` | `false` to keep the run green on verify-fail |
 | `issue-id` / `branch-name` / `pr-body` | *(auto)* | non-standard triggers that don't map a merge commit to a PR |
@@ -178,7 +227,11 @@ before it reaches a shell body — never interpolated into a `run:` string — s
 value can break out of its string context. Dynamic values injected into GraphQL
 go through `jq --arg` (JSON-encoded), never string-spliced into a query. The
 `verify-command` is executed as a deliberate `bash -c "$VERIFY_COMMAND"` and runs
-**without** the Linear API key in its environment. On the secret-free path the
+**without** the Linear API key in its environment. The harvest is distilled in a
+separate step with **no Linear key in scope**: the merged PR title/body, sha, and
+verdicts are env-bound and written to a file with `printf '%s'` (never a runnable
+position), and that file is injected into the harvest comment via `jq --arg` — so
+untrusted PR text can break out of neither a shell nor a GraphQL string. On the secret-free path the
 vault name and secret name reach `az keyvault secret show` as env values (never
 interpolated), the fetched key is `::add-mask::`-ed the moment it is read, and it
 stays a local shell variable inside the Linear step — never a job or step output.
