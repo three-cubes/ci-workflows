@@ -8,17 +8,26 @@ It is the piece that replaces the human hand-cranking the loop: each tick it
 self-selects the next READY work item, guardrail-gates it, and — **only when
 armed and live** — hands it to an agent-spawn seam.
 
-> **Arming is currently SAFE.** The spawn seam is a
-> [`LoggingDispatchSink`](loop_runner.py) — it records the dispatch contract and
-> **spawns nothing**. No real `DispatchSink` is wired, so even a fully armed,
-> live tick only **logs** the selection. Arming today changes what gets logged,
-> not what runs. A real spawn cannot happen until the org picks a runtime and
-> wires one of the stub sinks (below). Until then, arming has no blast radius.
+> **The real spawn seam is now WIRED — and arming is STILL safe until the keys
+> are set.** The runtime is
+> [`GitHubActionsDispatchSink`](loop_runner.py): on the go-live path it triggers
+> [`loop-implement.yml`](../../.github/workflows/loop-implement.yml) per item — a
+> GHA-hosted, headless `claude -p` run that implements the one work item and
+> opens the bot PR. It is selected by [`loop-dispatch.yml`](../../.github/workflows/loop-dispatch.yml)
+> **only** when `LOOP_ARMED == "true"` AND `LOOP_LIVE == "true"`; on every other
+> tick the runner falls back to the safe [`LoggingDispatchSink`](loop_runner.py)
+> (records the contract, **spawns nothing**). And even when the real sink is
+> wired, the runner's own gate ([`run_once`](loop_runner.py)) only *reaches* it
+> once armed + live + **past the soak window** + harness-green + not-halted — so a
+> disarmed / dry-run / soaking / red tick spawns nothing regardless. **Merging the
+> loop code changes NOTHING**: with the arming vars unset (the default) every tick
+> is dry-run and record-only. Arming for real is the deliberate two-key + soak act
+> below.
 
-> **⛔ DO NOT WIRE A REAL `DispatchSink` UNTIL THE ENFORCEABILITY PRECONDITIONS
-> HOLD.** A live sink on top of inert guardrails is a runaway. The guardrails are
-> only enforceable because three hardening fixes are in place; a future reviewer
-> MUST NOT swap a live sink onto the runner until all three still hold:
+> **⛔ THE ENFORCEABILITY PRECONDITIONS THAT MAKE THE LIVE SINK SAFE — they must
+> STAY in place.** A live sink on top of inert guardrails is a runaway. The real
+> sink is only safe to run because these three hardening fixes hold; a future
+> reviewer MUST NOT weaken any of them while the real sink is wired:
 > 1. **Durable cross-tick ledger** — the governor loads/persists a
 >    [`StateStore`](loop_governor.py) each tick (a versioned JSON blob on the
 >    dedicated `loop-state` git ref / an Azure blob — never the evictable Actions
@@ -32,8 +41,10 @@ armed and live** — hands it to an agent-spawn seam.
 > 3. **Soak before live** — the first `LOOP_SOAK_TICKS` armed ticks stay
 >    record-only, so a cold armed tick can never dispatch (see the soak section).
 >
-> These are covered by `tests/test_loop_hardening.py`; that harness must stay
-> green before precondition 4 (a real sink) is signed off.
+> These are covered by `tests/test_loop_hardening.py`, and the real sink's own
+> selection + gating is covered by `tests/test_loop_runner.py`
+> (`GitHubActionsDispatchSinkTest` + `RealSinkGatingTest`). Both harnesses must
+> stay green.
 
 This is a **CORE** repo, so per decision **D3** every change here — including
 flipping the arming variable's governance — takes **n+1 human review**.
@@ -54,17 +65,20 @@ fourth (soak) delays even that:
 4. **Past the soak window** — even with 1–3, the runner keeps the first
    `LOOP_SOAK_TICKS` armed ticks record-only; only after that can it dispatch.
 
-Even with all four, the runner reaches only the **`LoggingDispatchSink`**. So
-today "armed + live + past soak" == "logs the selection it would dispatch, with
-the governor's **durable** ledger advancing across ticks (persisted to the
-`loop-state` ref, so the ceilings actually trip tick-to-tick)". There is no path
-to a real spawn yet.
+Once all four hold, the runner reaches the **`GitHubActionsDispatchSink`**, which
+fires [`loop-implement.yml`](../../.github/workflows/loop-implement.yml) for the
+selected item (the real GHA-hosted `claude -p` executor — see the executor section
+below). Until the second key is set, "armed" == "logs the selection it would
+dispatch, with the governor's **durable** ledger advancing across ticks (persisted
+to the `loop-state` ref, so the ceilings actually trip tick-to-tick)" — the safe
+`LoggingDispatchSink` path, no spawn.
 
 ## PRECONDITIONS — all four before arming for real
 
-Do not set `LOOP_ARMED=true` with intent to dispatch for real until **every** one
-of these holds. (Arming while the sink is still `LoggingDispatchSink` is safe and
-is a useful shakedown — it exercises selection + gating with zero blast radius.)
+Do not set `LOOP_LIVE=true` with intent to dispatch for real until **every** one
+of these holds. (Setting only `LOOP_ARMED=true` — leaving `LOOP_LIVE` unset — is a
+safe shakedown: it exercises selection + gating + the soak in record-only mode
+with the safe `LoggingDispatchSink` and zero blast radius.)
 
 | # | Precondition | Evidence |
 |---|---|---|
@@ -73,22 +87,67 @@ is a useful shakedown — it exercises selection + gating with zero blast radius
 | 3 | **Budget + retry caps configured** — the ceilings below are set deliberately for this fleet + cost model, not left at defaults by accident. | The `GuardrailConfig` in force (see the table); reviewed in the arming PR. |
 | 3a | **Durable cross-tick ledger wired** — the workflow materialises the `loop-state` git ref into `--state-file` and writes it back, so the governor's retry/budget/circuit-breaker counters accumulate across the fresh-process ticks (they are inert otherwise). An armed **live** tick with no durable store is refused. | The restore/persist steps in [`loop-dispatch.yml`](../../.github/workflows/loop-dispatch.yml); the cross-tick tests in `tests/test_loop_hardening.py` green. |
 | 3b | **Soak window configured** — `LOOP_SOAK_TICKS` set so the first N armed ticks stay record-only; the first armed cron tick never dispatches. | `LOOP_SOAK_TICKS` repo variable (default 3); the soak tests green. |
-| 4 | **A real `DispatchSink` chosen + wired** — exactly one of the stub seams is implemented and swapped in for `LoggingDispatchSink`, with its own review + tests, **and only after 3a + 3b + fail-closed 2 are confirmed still in place** (a live sink on inert guardrails is a runaway). | A merged PR implementing the chosen sink; the CLI/workflow updated to use it; `test_loop_hardening.py` still green. |
+| 4 | **A real `DispatchSink` chosen + wired** — SATISFIED: [`GitHubActionsDispatchSink`](loop_runner.py) is implemented and selected by [`loop-dispatch.yml`](../../.github/workflows/loop-dispatch.yml) on the go-live path, with its own review + tests, on top of 3a + 3b + fail-closed 2. | This PR: `GitHubActionsDispatchSink` + `loop-implement.yml`; `test_loop_runner.py` (`GitHubActionsDispatchSinkTest` + `RealSinkGatingTest`) and `test_loop_hardening.py` green. |
+| 4a | **The bot App is installed with the permissions the executor + dispatch need** — the `three-cubes-agent` App has `actions: write` on `tc-pipelines` (so the App-token-triggered `workflow_dispatch` actually runs `loop-implement.yml`), and `contents: write` + `pull-requests: write` on each TARGET product repo (so the executor can push its branch and open/auto-merge the PR). | The App's installation permissions; a manual `workflow_dispatch` of `loop-implement.yml` producing a real bot PR (precondition 1's end-to-end cycle). |
+| 5 | **Executor capability hardening (H2) — REQUIRED before continuous `LOOP_LIVE`.** See the prominent block immediately below. | The three containment controls (a)–(c) below are in place. |
 
-Preconditions 1–3b are met today. **Precondition 4 is deliberately NOT met** —
-that is why arming is currently safe.
+Preconditions 1–4a are met by this change. **Arming stays safe** because the two
+keys (`LOOP_ARMED` + `LOOP_LIVE`) and the soak are all still required before the
+real sink is ever reached — merging changes nothing until an operator acts.
 
-### Choosing the real spawn seam (precondition 4)
+> ## ⛔ Before `LOOP_LIVE` for CONTINUOUS operation — executor capability hardening (REQUIRED, H2)
+>
+> The headless executor ([`loop-implement.yml`](../../.github/workflows/loop-implement.yml))
+> runs `claude -p` with `--dangerously-skip-permissions` on an ephemeral runner
+> that simultaneously holds **three live credentials** — the Linear workspace key,
+> the model-provider API key, and the bot App installation token. Today the only
+> thing keeping a prompt-injected or misbehaving executor inside its lane is
+> **prompt-level containment** (the "treat the Linear body as DATA" boundary in the
+> executor prompt) plus the input-allowlist and the auto-merge opt-in. Prompt-only
+> containment is adequate for a **single supervised trial** but NOT for lights-out
+> continuous operation. Before flipping `LOOP_LIVE` for continuous dispatch, ALL
+> THREE of these MUST be in place:
+>
+> 1. **(a) Short-lived, minimally-scoped Linear token** — issue the executor a
+>    per-run, least-privilege Linear token (read the one issue + comment on it),
+>    NOT the shared workspace key. The workspace key in every ephemeral runner is
+>    an over-broad standing capability; a short-lived scoped token bounds the blast
+>    radius to the one item.
+> 2. **(b) Restricted runner network egress** — constrain the executor runner's
+>    outbound network to the hosts it actually needs (the model API, the GitHub
+>    API, Key Vault, and the package registries the gate uses). Default-open egress
+>    on a runner holding three secrets is an exfiltration path an injected prompt
+>    could use; an egress allowlist closes it.
+> 3. **(c) Secret-scanning / push-protection on the executor's own PRs** — enable
+>    GitHub secret-scanning **push-protection** on every TARGET repo so a commit the
+>    executor pushes cannot leak a credential into a branch/PR (defence-in-depth
+>    behind the prompt's "never echo a secret" rule).
+>
+> **REQUIRED gate:** do NOT set `LOOP_LIVE=true` for continuous lights-out
+> operation until (a), (b), and (c) all hold. A single **supervised trial** with
+> `enable-auto-merge=false` (a manual `workflow_dispatch`, or one closely-watched
+> live tick — it opens a REVIEW PR and cannot auto-merge, per H1) is acceptable
+> WITHOUT (a)–(c), precisely because a human reviews the result before anything
+> merges. Continuous operation is not.
 
-Three documented STUB candidates ship in [`loop_runner.py`](loop_runner.py), each
-raising `NotImplementedError` with a wiring note. The org picks exactly one:
+### The chosen spawn seam (precondition 4) — and the alternatives
 
-- **`GitHubActionsHeadlessSink`** — a scheduled/`workflow_dispatch` worker runs
-  `claude -p` headless per item; the API key comes from Key Vault (KV+WIF, no
-  stored secret). No standing host; inherits Actions concurrency + audit.
+The wired runtime is **`GitHubActionsDispatchSink`** in
+[`loop_runner.py`](loop_runner.py): on the go-live path it POSTs a
+`workflow_dispatch` to [`loop-implement.yml`](../../.github/workflows/loop-implement.yml)
+for the one selected item (issue id / branch / repo as inputs, all strict-pattern
+validated before they reach the request), using the bot App installation token
+(minted secret-free via WIF + Key Vault). A 201/204 means the executor run was
+spawned; anything else fails CLOSED (the runner never records a phantom spawn).
+
+Three other candidates remain in `loop_runner.py` as documented STUBs (each raises
+`NotImplementedError`) so a future reviewer can see the menu that was considered:
+
+- **`GitHubActionsHeadlessSink`** — the original un-parameterised description of
+  the GHA-hosted seam, now realized as `GitHubActionsDispatchSink`.
 - **`AgentPlatformSink`** — hand the contract to the standing
-  `tc-agent-zone` / `vm-openclaw` runner (the persistent OpenClaw gateway that
-  already enforces the subagent-spawning decision hook and feeds the spend path).
+  `tc-agent-zone` / `vm-openclaw` runner (the persistent OpenClaw gateway). NOT
+  chosen — the GHA-hosted path needs no standing host and NOTHING touches openclaw.
 - **`LinearDelegationSink`** — set the Linear `delegate = agent` so Linear's
   native agent integration picks the item up; dispatch becomes one idempotent
   Linear mutation.
@@ -141,8 +200,11 @@ raising `NotImplementedError` with a wiring note. The org picks exactly one:
 
    Only now do scheduled ticks leave dry-run — and only once the runner's own
    soak counter (persisted in the `loop-state` ref) has also elapsed, so the
-   very first armed tick still cannot dispatch. While the sink is still
-   `LoggingDispatchSink`, even live ticks **log only**.
+   very first armed tick still cannot dispatch. From this point a live tick
+   **fires the real `GitHubActionsDispatchSink`**: it triggers
+   [`loop-implement.yml`](../../.github/workflows/loop-implement.yml) for the
+   selected item, and a GHA-hosted `claude -p` run implements it and opens the
+   bot PR. Confirm the App's installation permissions (precondition 4a) first.
 
 A scheduled tick goes live only when **`LOOP_ARMED` AND `LOOP_LIVE` are both
 `true` AND the soak has elapsed**. A **manual** run (`workflow_dispatch`) stays
@@ -192,15 +254,15 @@ Any one of these stops the loop; **it takes effect on the next tick**:
 - **Disable the workflow** (Actions tab → `loop-dispatch` → *Disable workflow*),
   or delete/comment the `schedule:` trigger. No further ticks fire.
 
-**In-flight work.** Today there is nothing in flight to stop: the sink spawns
-nothing. **Once a real `DispatchSink` is wired**, disarming stops *new* dispatch
-on the next tick; already-spawned agents are not force-killed by the switch —
-they either finish their current item or are stopped out-of-band (cancel the
-worker run for `GitHubActionsHeadlessSink`; stop the agent on the platform for
-`AgentPlatformSink`; un-delegate the Linear issue for `LinearDelegationSink`).
-The kill-switch is fail-safe for *dispatch*, not a remote agent-abort — that is
-the chosen runtime's responsibility, and the sink's wiring note must document it
-before precondition 4 is signed off.
+**In-flight work.** The real sink is now wired, so a live tick can have spawned a
+per-item [`loop-implement.yml`](../../.github/workflows/loop-implement.yml) run.
+Disarming (either key) stops *new* dispatch on the next tick, but does **not**
+force-kill an already-spawned executor run: cancel that run from the Actions tab
+(`loop-implement` → the run for the issue → *Cancel*) to stop it mid-flight, or
+let it finish / hit its `--max-turns` + `timeout` bound. The kill-switch is
+fail-safe for *dispatch*, not a remote agent-abort — the executor's own bounds
+(per-item turn cap + wall-clock timeout + job `timeout-minutes`) cap a run that is
+already in flight.
 
 ## ESCALATION path
 
@@ -251,6 +313,78 @@ returning the same item, the governor stops re-dispatching it after
 makes the per-issue budget, the global budget, and the cross-issue circuit-breaker
 actually trip tick-to-tick (proven in `tests/test_loop_hardening.py`).
 
+## THE EXECUTOR — `loop-implement.yml`
+
+The real sink's target is
+[`.github/workflows/loop-implement.yml`](../../.github/workflows/loop-implement.yml):
+the GHA-hosted, headless agent-execution runtime that turns ONE selected work item
+into a working bot PR. `GitHubActionsDispatchSink` triggers it via
+`workflow_dispatch` with three inputs — `issue-id`, `issue-branch`, `repo` — each
+strict-pattern-validated on both sides (the sink before it posts, and the workflow
+before it uses them). It runs on `ubuntu-latest`; **NOTHING touches openclaw**.
+
+Per tick, one item. The workflow, in order:
+
+1. **Validates** `issue-id` / `issue-branch` / `repo` against strict charset
+   allowlists (rejecting the `unknown` sentinel) and resolves a bare repo name to
+   `owner/name` — injection-safe: env-bound, never interpolated raw. It then pins
+   the resolved TARGET repo to an **explicit org-repo allowlist**
+   (`LOOP_ALLOWED_REPOS`, default `kairix kata tc-agent-zone tc-pipelines
+   data-visualisation`) and FAILS the job — **before any App token is minted** —
+   if the target is not on it. The repo is inferred from attacker-influenceable
+   Linear content, so the allowlist is the boundary that stops it selecting an
+   arbitrary repo.
+2. **Federates to Azure (WIF)** — no stored credential — and reads the model key
+   (`anthropic-api-key`) and Linear key (`ci-verify-and-close`) from Key Vault
+   `kv-tc-agents`, masked the instant they are read and kept step-local (never an
+   output). Same KV+WIF pattern as [`verify-and-close.yml`](verify-and-close.md).
+3. **Mints the bot App token** from the App id + private key ALSO in the vault
+   (via the [`github-app-token`](../../.github/actions/github-app-token/action.yml)
+   composite), scoped to the TARGET repo — so every git/gh write is the
+   `three-cubes-agent` App, never a human PAT, never GITHUB_TOKEN.
+4. **Checks out the target repo** on the issue branch and runs `claude -p`
+   HEADLESS with a tightly-scoped executor prompt: read the item from Linear,
+   implement only it, run the repo gate green, commit D1-clean (canonical bot
+   identity, ZERO AI attribution), and open the bot PR.
+
+**Auto-merge is STRICTLY OPT-IN (H1).** The executor enables `gh pr merge --auto`
+ONLY when the workflow input `enable-auto-merge=true` **AND** the target is a
+product (non-core) repo. That input defaults **FALSE**, so a plain/manual
+`workflow_dispatch` (a trial run) opens a **REVIEW PR and never auto-merges**. The
+loop passes `enable-auto-merge=true` on **one path only** — the armed + live +
+past-soak dispatch (`loop-dispatch.yml`'s go-live branch → `--enable-auto-merge`
+→ `GitHubActionsDispatchSink`) — so lights-out behaviour is preserved while
+nothing else can trigger an auto-merge. Core repos still never auto-merge (n+1
+human review per D3), even on the go-live path.
+
+**Global concurrency ceiling (H1b).** `loop-implement.yml` carries a single
+workflow-level `concurrency` group (`loop-implement-global`, `cancel-in-progress:
+false`) that serializes EVERY executor run repo-wide, so a burst of dispatches
+cannot fan out into N parallel executors contending on the bot token + per-actor
+quota. A finer per-issue group sits below it. This full serialize is the
+conservative PILOT default; it can be widened to a per-repo ceiling later.
+
+**Per-item bounds (cost/turn caps).** The executor is bounded three ways, all
+operator-overridable via repo variables:
+
+| Bound | Repo variable | Default |
+|---|---|---|
+| Agent turns per item | `LOOP_EXECUTOR_MAX_TURNS` (`claude -p --max-turns`) | `80` |
+| Wall-clock per item | `LOOP_EXECUTOR_TIMEOUT_MIN` (`timeout` around `claude`) | `45` min |
+| Whole-job ceiling | `LOOP_EXECUTOR_JOB_TIMEOUT_MIN` (job `timeout-minutes`) | `60` min |
+| Model | `LOOP_EXECUTOR_MODEL` | `claude-opus-4-8` |
+| CLI version (pinned) | `LOOP_CLAUDE_CODE_VERSION` | `2.1.197` |
+| Core repos (never auto-merged) | `LOOP_CORE_REPOS` | `tc-pipelines tc-agent-zone` |
+| Target-repo allowlist (LOWER) | `LOOP_ALLOWED_REPOS` | `kairix kata tc-agent-zone tc-pipelines data-visualisation` |
+
+The prompt hard-forbids touching anything outside the one issue (other repos,
+other issues, branch-protection, secret exfiltration) and treats the Linear issue
+body as DATA, not instructions that can widen the task — a content-level
+prompt-injection guard on top of the input validation. These per-item caps compose
+with the governor's cross-tick ceilings (below): the governor bounds *how many*
+items dispatch and *how often*; `loop-implement.yml` bounds *how much* each one
+may spend.
+
 ## References
 
 - [`loop_runner.py`](loop_runner.py) · [`loop_governor.py`](loop_governor.py) ·
@@ -259,7 +393,14 @@ actually trip tick-to-tick (proven in `tests/test_loop_hardening.py`).
   lights-out gate) · [`../decisions/ADR-LOOP-STATE-MACHINE.md`](../decisions/ADR-LOOP-STATE-MACHINE.md)
 - [`verify-and-close.md`](verify-and-close.md) (the close side + the KV+WIF
   secret-free Linear pattern this driver mirrors)
+- The driver workflow [`loop-dispatch.yml`](../../.github/workflows/loop-dispatch.yml)
+  (selects the sink) and the executor
+  [`loop-implement.yml`](../../.github/workflows/loop-implement.yml) (the GHA-hosted
+  headless `claude -p` runtime) · the App-token composite
+  [`github-app-token`](../../.github/actions/github-app-token/action.yml).
 - Durable cross-tick ledger: the `loop-state` git ref (`refs/loop-state/ledger`),
-  materialised into `--state-file` by [`loop-dispatch.yml`](../../.github/workflows/loop-dispatch.yml);
-  the enforceability proofs live in [`tests/test_loop_hardening.py`](tests/test_loop_hardening.py).
+  materialised into `--state-file` by `loop-dispatch.yml`; the enforceability
+  proofs live in [`tests/test_loop_hardening.py`](tests/test_loop_hardening.py),
+  and the real-sink selection + gating in
+  [`tests/test_loop_runner.py`](tests/test_loop_runner.py).
 - Linear: Increment 3 (`d4b8c682-a2cf-40e6-be44-86960d1505cd`); SP-C (PLA-309–315).

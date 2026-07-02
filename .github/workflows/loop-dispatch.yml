@@ -25,16 +25,21 @@ name: loop-dispatch
 #     after — so the guardrails actually accumulate and trip ACROSS ticks. Each
 #     tick is a fresh process; without this the ceilings would reset every tick
 #     and be inert. An armed + live tick refuses to run without the durable file.
-#   * Even fully armed + live + past soak, the runner CLI wires ONLY the
-#     LoggingDispatchSink (the safe default) — so it STILL only logs. The real
-#     agent-spawn seam is intentionally NOT connected here; wiring a real
-#     DispatchSink is a separate, deliberate change AND is gated on FIX 1/2/3
-#     being in place (see governance/loop/ARMING.md). Arming is therefore
-#     currently safe: there is no runtime that could spawn.
+#   * SINK SELECTION is belt-and-suspenders with the runner's own gate. On the
+#     go-live path ONLY — repo vars LOOP_ARMED == "true" AND LOOP_LIVE == "true"
+#     AND (a scheduled tick, or a manual tick with dry_run=false) — this workflow
+#     mints the bot App dispatch token and passes `--sink github-actions`, wiring
+#     the REAL GitHubActionsDispatchSink (which triggers loop-implement.yml per
+#     item). On EVERY other tick it passes nothing, so the runner falls back to
+#     the safe LoggingDispatchSink (logs only). The real sink is only ever
+#     REACHED after the runner's own armed + live + past-soak + harness-green gate
+#     also opens (run_once), so a dry-run/disarmed/soaking/red tick spawns nothing
+#     even when the real sink is wired. See governance/loop/ARMING.md.
 #
 # KILL-SWITCH: set repo variable LOOP_ARMED (or LOOP_LIVE) to anything but "true"
-# (or disable this workflow). Takes effect on the next tick — no in-flight spawn
-# to stop, because nothing spawns yet.
+# (or disable this workflow). Takes effect on the NEXT tick: an already-spawned
+# per-item loop-implement.yml run is not force-killed — cancel that run from the
+# Actions tab to stop it — but no NEW item is dispatched. See ARMING.md.
 #
 # SECRET-FREE Linear read (recommended path, mirrors verify-and-close.yml): when
 # repo variable LOOP_LINEAR_KEY_VAULT names an Azure Key Vault, the job federates
@@ -132,10 +137,32 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Mint bot App dispatch token (go-live path ONLY)
+        # Belt-and-suspenders sink selection: mint the bot App installation token
+        # that the runner's REAL GitHubActionsDispatchSink uses to POST the
+        # per-item workflow_dispatch — but ONLY on the exact go-live condition
+        # (armed AND live AND a scheduled tick, or a manual tick with dry_run
+        # false). On every other tick this step is skipped, its token output is
+        # empty, and the runner falls back to the safe LoggingDispatchSink. The
+        # token is scoped to THIS repo (tc-pipelines) — where loop-implement.yml
+        # lives — and must be a non-Actions token so the dispatched workflow
+        # actually runs (a GITHUB_TOKEN-triggered workflow_dispatch would not).
+        id: dispatch_app
+        if: >-
+          vars.LOOP_ARMED == 'true' && vars.LOOP_LIVE == 'true' &&
+          (github.event_name == 'schedule' || github.event.inputs.dry_run == 'false')
+        uses: ./.github/actions/github-app-token
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
       - name: Run the loop runner (dry-run unless armed + LOOP_LIVE + past soak)
         # All dynamic values are env-bound (injection-safe); nothing is spliced
         # into the run body. The Linear key is fetched INSIDE this step, masked,
-        # and kept a local shell variable — never a job/step output.
+        # and kept a local shell variable — never a job/step output. On the go-live
+        # path the minted App dispatch token (also masked) is passed to the REAL
+        # sink; otherwise it is empty and the default LoggingDispatchSink is used.
         env:
           LOOP_ARMED: ${{ vars.LOOP_ARMED }}
           LOOP_LIVE: ${{ vars.LOOP_LIVE }}
@@ -145,6 +172,10 @@ jobs:
           INITIATIVE: ${{ vars.LOOP_INITIATIVE || '7e522d9b-8cb2-45d2-a8ca-4ee6f83d554d' }}
           REQUEST_DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
           EVENT_NAME: ${{ github.event_name }}
+          # The bot App dispatch token (empty unless the go-live mint step ran) and
+          # the orchestrator repo hosting loop-implement.yml, for the REAL sink.
+          DISPATCH_TOKEN: ${{ steps.dispatch_app.outputs.token }}
+          DISPATCH_REPO: ${{ github.repository }}
         working-directory: governance/loop
         shell: bash
         run: |
@@ -186,28 +217,48 @@ jobs:
             export LINEAR_API_KEY="$linear_key"
           fi
 
-          # --- Build the runner invocation. The CLI wires ONLY LoggingDispatchSink
-          #     (no real spawn seam), so even `--armed --live` ONLY LOGS — the
-          #     spawn seam is intentionally not connected until the org picks a
-          #     runtime (ARMING.md). The runner ALSO (a) self-confirms the
-          #     guardrail harness this tick and REFUSES (non-zero) if it is red,
-          #     (b) loads/persists the DURABLE ledger via --state-file so the
-          #     ceilings accumulate across ticks, and (c) enforces the SOAK window
-          #     via --soak-ticks. The runner is one-item-per-tick by design
-          #     (run_once selects a single READY item); the */30 cadence is the
-          #     throttle, so there is no --limit. ---
+          # --- Build the runner invocation. On the go-live path (dry_run=false)
+          #     the CLI wires the REAL GitHubActionsDispatchSink (--sink
+          #     github-actions), which triggers loop-implement.yml per item;
+          #     otherwise it uses the safe default LoggingDispatchSink (logs only).
+          #     This is belt-and-suspenders with the runner's own gate: even with
+          #     the real sink wired, run_once only REACHES it once armed + live +
+          #     past-soak + harness-green, so a soaking/red tick still spawns
+          #     nothing. The runner ALSO (a) self-confirms the guardrail harness
+          #     this tick and REFUSES (non-zero) if it is red, (b) loads/persists
+          #     the DURABLE ledger via --state-file so the ceilings accumulate
+          #     across ticks, and (c) enforces the SOAK window via --soak-ticks.
+          #     The runner is one-item-per-tick by design (run_once selects a
+          #     single READY item); the */30 cadence is the throttle, no --limit. ---
           args=(--json --initiative "$INITIATIVE"
                 --state-file "$state_file" --soak-ticks "$SOAK_TICKS")
+          sink="LoggingDispatchSink (logs only)"
           if [[ "$armed" == "true" ]]; then
             args+=(--armed)
             if [[ "$dry_run" == "false" ]]; then
               args+=(--live)
+              # Go-live: wire the REAL sink. The dispatch token MUST have been
+              # minted (same go-live condition as this branch) — fail CLOSED if
+              # not, rather than silently degrading to a no-op logging sink.
+              if [[ -z "${DISPATCH_TOKEN:-}" ]]; then
+                echo "::error::loop-dispatch: go-live path but no bot App dispatch" \
+                  "token was minted — refusing to run the real sink."
+                exit 1
+              fi
+              export LOOP_DISPATCH_TOKEN="$DISPATCH_TOKEN"
+              # H1: the go-live path is the ONLY place auto-merge is enabled.
+              # --enable-auto-merge makes the REAL sink pass enable-auto-merge=true
+              # in the per-item loop-implement dispatch (product repos auto-merge;
+              # core repos still take n+1 review). Every other tick omits it, and a
+              # manual/trial dispatch of loop-implement defaults it false → review
+              # PR — so nothing but this armed+live+past-soak path can auto-merge.
+              args+=(--sink github-actions --dispatch-repo "$DISPATCH_REPO" --enable-auto-merge)
+              sink="GitHubActionsDispatchSink -> loop-implement.yml on $DISPATCH_REPO"
             fi
           fi
 
           echo "loop-dispatch: armed=$armed live_key=$live_key dry_run=$dry_run" \
-            "soak_ticks=$SOAK_TICKS event=${EVENT_NAME}" \
-            "(sink=LoggingDispatchSink — logs only; no runtime wired)"
+            "soak_ticks=$SOAK_TICKS event=${EVENT_NAME} (sink=$sink)"
           echo "::group::loop-runner result"
           python3 -m loop_runner "${args[@]}"
           echo "::endgroup::"

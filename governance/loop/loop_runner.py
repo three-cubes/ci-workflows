@@ -71,8 +71,11 @@ or against live Linear (needs ``LINEAR_API_KEY``)::
 
     LINEAR_API_KEY=lin_api_… python3 -m loop_runner --json
 
-Arming is a deliberate act (``--armed --live``) and STILL only logs until a real
-:class:`DispatchSink` is wired — see ``governance/loop/ARMING.md``.
+Arming is a deliberate act (``--armed --live``). The DEFAULT sink is still the
+safe :class:`LoggingDispatchSink` (records, spawns nothing); the REAL runtime is
+:class:`GitHubActionsDispatchSink` (GHA-hosted headless ``claude -p`` per item),
+opt-in via ``--sink github-actions`` and reached ONLY on the armed + live +
+past-soak path — see ``governance/loop/ARMING.md``.
 """
 
 from __future__ import annotations
@@ -80,12 +83,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional, Protocol, runtime_checkable
+from typing import Callable, Optional, Protocol, Tuple, runtime_checkable
 
 # ``loop_dispatcher`` / ``loop_governor`` / ``loop_state_machine`` are sibling
 # modules (this dir is not a package — the tests use the same path shim). Import
@@ -191,40 +197,187 @@ class LoggingDispatchSink:
 
 
 # --------------------------------------------------------------------------- #
-# STUB spawn seams — the pluggable candidates the org will choose between.
+# The REAL spawn seam — GHA-hosted headless `claude -p` per item.
+#
+# This is the concrete, wired agent-execution runtime that turns a selected work
+# item into a working bot PR. It triggers ``.github/workflows/loop-implement.yml``
+# via a ``workflow_dispatch`` REST call, passing the contract's issue id, branch,
+# and repo as inputs; the workflow then federates to Azure (WIF), reads the model
+# key + Linear key from Key Vault, mints the bot App token, checks out the target
+# repo on the issue branch, and runs ``claude -p`` headless to implement the one
+# item and open the bot PR — mirroring the KV+WIF secret-free pattern in
+# ``verify-and-close.yml``. NOTHING here spawns until the runner has already
+# decided armed + live + past-soak (see :meth:`Runner.run_once`); this class is
+# the seam the runner hands the gated contract to on that single path.
+# --------------------------------------------------------------------------- #
+
+#: Injectable HTTP transport seam: ``(url, body_bytes, headers) -> (status, text)``.
+#: The default (:func:`_default_dispatch_transport`) uses stdlib ``urllib``; tests
+#: inject a fake so the dispatch is fully exercisable offline (no network).
+DispatchTransport = Callable[[str, bytes, dict], Tuple[int, str]]
+
+# INJECTION-SAFE validation: every value that reaches the GitHub REST call (the
+# contract's issue id / branch / repo AND the orchestrator repo + workflow file)
+# is matched against a strict allowlist pattern BEFORE it is placed in the URL or
+# the JSON body. Anything outside the pattern raises — nothing is ever spliced
+# into a request raw.
+_ISSUE_ID_RE = re.compile(r"^[A-Z][A-Z0-9]*-[0-9]+$")  # e.g. SGO-76
+_BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")  # a Linear gitBranchName, e.g. dan/sgo-76-slug
+_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")  # owner/name (the orchestrator repo)
+# The TARGET repo the executor runs against: the dispatcher infers a BARE name
+# (e.g. ``kairix``) or an ``owner/name``; loop-implement.yml qualifies a bare name
+# with the org owner. Either shape is accepted; ``unknown`` (the dispatcher's
+# "could not resolve" sentinel) is rejected so we never spawn against no repo.
+_TARGET_REPO_RE = re.compile(r"^(?:[A-Za-z0-9._-]+/)?[A-Za-z0-9._-]+$")
+_WORKFLOW_RE = re.compile(r"^[A-Za-z0-9._-]+\.ya?ml$")  # a workflow file name
+
+
+def _default_dispatch_transport(url: str, body: bytes, headers: dict) -> Tuple[int, str]:
+    """POST ``body`` to ``url`` via stdlib ``urllib`` (no third-party deps).
+
+    Returns ``(status, text)``. An ``HTTPError`` is caught and surfaced as its
+    status code so the caller decides how to treat a non-2xx (the sink fails
+    CLOSED on anything but 201/204)."""
+    req = urllib.request.Request(  # noqa: S310 - fixed GitHub API host, values validated
+        url, data=body, headers=headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:  # noqa: S310 - fixed GitHub API host
+            return resp.status, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:  # pragma: no cover - network error shape
+        return exc.code, exc.read().decode("utf-8", "replace")
+
+
+@dataclass
+class GitHubActionsDispatchSink:
+    """REAL, WIRED spawn seam: trigger ``loop-implement.yml`` for the contract.
+
+    On :meth:`dispatch` it POSTs a ``workflow_dispatch`` to the GitHub REST API
+    against the orchestrator repo's ``.github/workflows/loop-implement.yml``,
+    passing the contract's ``issue_id`` / ``branch`` / ``repo`` as workflow inputs.
+    A 201/204 means the GHA-hosted executor run was spawned; anything else fails
+    CLOSED (raises) so the runner never records a phantom spawn.
+
+    The ``token`` is the bot App installation token (minted secret-free via
+    WIF + Key Vault by the caller — never a human PAT); the HTTP transport is an
+    injected seam (:data:`DispatchTransport`), so the dispatch decision is fully
+    testable offline. This sink is only ever REACHED on the runner's single
+    armed + live + past-soak path — the gating lives in :meth:`Runner.run_once`,
+    not here.
+    """
+
+    token: str
+    repo: str  # orchestrator repo hosting loop-implement.yml, "owner/name"
+    workflow: str = "loop-implement.yml"
+    ref: str = "main"
+    api_url: str = "https://api.github.com"
+    transport: DispatchTransport = _default_dispatch_transport
+    # H1: auto-merge is STRICTLY OPT-IN. This is passed as the workflow's
+    # `enable-auto-merge` input; loop-implement.yml only auto-merges a product-repo
+    # PR when it is true. The caller (_build_sink) sets it True ONLY on the armed +
+    # live dispatch path, so a manually-triggered or logging dispatch never
+    # auto-merges. Default False keeps every other construction review-only.
+    enable_auto_merge: bool = False
+
+    def _validate(self, contract: DispatchContract) -> None:
+        """Reject anything outside the strict allowlist BEFORE it reaches a
+        request — the contract fields AND this sink's own repo/workflow config."""
+        if not _ISSUE_ID_RE.match(contract.issue_id or ""):
+            raise ValueError(f"GitHubActionsDispatchSink: refusing unsafe issue id {contract.issue_id!r}")
+        if not _BRANCH_RE.match(contract.branch or ""):
+            raise ValueError(f"GitHubActionsDispatchSink: refusing unsafe branch {contract.branch!r}")
+        if (contract.repo or "") == "unknown" or not _TARGET_REPO_RE.match(contract.repo or ""):
+            raise ValueError(f"GitHubActionsDispatchSink: refusing unresolved/unsafe target repo {contract.repo!r}")
+        if not _REPO_RE.match(self.repo or ""):
+            raise ValueError(f"GitHubActionsDispatchSink: refusing unsafe orchestrator repo {self.repo!r}")
+        if not _WORKFLOW_RE.match(self.workflow or ""):
+            raise ValueError(f"GitHubActionsDispatchSink: refusing unsafe workflow {self.workflow!r}")
+        if not self.token:
+            raise ValueError("GitHubActionsDispatchSink: no dispatch token (fail-closed)")
+
+    def dispatch(self, contract: DispatchContract) -> DispatchResult:
+        self._validate(contract)
+        url = f"{self.api_url}/repos/{self.repo}/actions/workflows/{self.workflow}/dispatches"
+        payload = {
+            "ref": self.ref,
+            "inputs": {
+                "issue-id": contract.issue_id,
+                "issue-branch": contract.branch,
+                "repo": contract.repo,
+                # H1: workflow_dispatch inputs are strings; GitHub coerces the
+                # boolean input. Auto-merge stays opt-in — this is "true" only when
+                # the sink was built on the armed+live path (see _build_sink); the
+                # workflow itself also defaults it false for any other caller.
+                "enable-auto-merge": "true" if self.enable_auto_merge else "false",
+            },
+        }
+        body = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self.token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+            "User-Agent": "tc-loop-dispatch",
+        }
+        status, text = self.transport(url, body, headers)
+        # workflow_dispatch returns 204 No Content on success (some proxies 201).
+        if status not in (201, 204):
+            raise RuntimeError(
+                f"GitHubActionsDispatchSink: workflow_dispatch for {contract.issue_id} "
+                f"failed — HTTP {status}: {text[:200]!r}"
+            )
+        # The dispatch API returns no run id, so the best available run ref is the
+        # workflow's runs page (filter by branch/actor there).
+        run_ref = f"https://github.com/{self.repo}/actions/workflows/{self.workflow}"
+        return DispatchResult(
+            spawned=True,
+            sink="github-actions",
+            issue_id=contract.issue_id,
+            detail=(
+                f"triggered {self.workflow} (workflow_dispatch @ {self.ref}) on {self.repo} "
+                f"for {contract.issue_id} → {contract.repo}@{contract.branch}"
+            ),
+            ref=run_ref,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# STUB spawn seams — the OTHER pluggable candidates the org considered.
 #
 # Each is a clearly-marked STUB: a documented candidate for the live agent-spawn
-# runtime. NONE is implemented — every one raises NotImplementedError with a
-# one-paragraph wiring note. Choosing + implementing exactly one of these (and
-# only then swapping it in for LoggingDispatchSink) is a precondition of arming
-# for real (see ARMING.md). Until then the runner uses LoggingDispatchSink and
-# dispatches nothing.
+# runtime that was NOT chosen. Every one raises NotImplementedError with a
+# one-paragraph wiring note. The chosen + realized runtime is
+# :class:`GitHubActionsDispatchSink` above; these remain as the historical menu
+# so a future reviewer can see the alternatives (see ARMING.md).
 # --------------------------------------------------------------------------- #
 @dataclass
 class GitHubActionsHeadlessSink:
-    """STUB · candidate spawn seam: a scheduled GitHub-Actions job runs Claude
-    Code headless per item.
+    """STUB · the ORIGINAL, un-parameterised description of the GHA-hosted spawn
+    seam — **now REALIZED as :class:`GitHubActionsDispatchSink`** (above).
 
-    Wiring note: on dispatch, this seam would trigger a per-item GitHub-Actions
-    run (``workflow_dispatch`` / ``repository_dispatch`` against a
-    ``loop-agent.yml`` worker) that checks out the contract's ``repo`` at the
-    contract's ``branch`` and runs ``claude -p`` in headless/print mode with the
-    acceptance-criteria pointer as the prompt, the agent's own App token minted
-    via WIF + Key Vault (never a human PAT), and the model-provider API key read
-    from Key Vault at run time (never a stored GitHub secret) — mirroring the KV+WIF
-    pattern in ``verify-and-close.yml``. It is attractive because it needs no
-    standing host (each item is an ephemeral runner) and inherits Actions'
-    concurrency + audit log, but it must respect the governor's dispatch
-    rate-limit so a fan-out cannot trip the shared per-actor Linear/API quota.
-    Not implemented here on purpose — the live spawn is deferred until the org
-    picks a runtime.
+    Wiring note (as chosen + built): on dispatch, this seam triggers a per-item
+    GitHub-Actions run (``workflow_dispatch`` against
+    ``.github/workflows/loop-implement.yml``) that checks out the contract's
+    ``repo`` at the contract's ``branch`` and runs ``claude -p`` in headless/print
+    mode with the acceptance criteria as the prompt, the agent's own App token
+    minted via WIF + Key Vault (never a human PAT), and the model-provider API key
+    read from Key Vault at run time (never a stored GitHub secret) — mirroring the
+    KV+WIF pattern in ``verify-and-close.yml``. It needs no standing host (each item
+    is an ephemeral GitHub-hosted runner) and inherits Actions' concurrency + audit
+    log, and it respects the governor's one-item-per-tick cadence so a fan-out
+    cannot trip the shared per-actor Linear/API quota.
+
+    Kept as the historical, un-parameterised menu entry; the concrete wired
+    implementation is :class:`GitHubActionsDispatchSink`. It deliberately still
+    raises so nothing selects the un-parameterised stub by accident.
     """
 
     def dispatch(self, contract: DispatchContract) -> DispatchResult:
         raise NotImplementedError(
-            "GitHubActionsHeadlessSink is a documented STUB candidate — the live "
-            "`claude -p` headless spawn is intentionally not wired. See the class "
-            "docstring and governance/loop/ARMING.md."
+            "GitHubActionsHeadlessSink is the historical STUB description — the live "
+            "GHA-hosted `claude -p` spawn is now realized by GitHubActionsDispatchSink "
+            "(parameterised with the dispatch token + orchestrator repo). See that "
+            "class and governance/loop/ARMING.md."
         )
 
 
@@ -748,8 +901,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--armed",
         action="store_true",
         help="Arm auto-dispatch (refused unless the guardrail harness validates). "
-        "Default: DISARMED. Even armed, the CLI wires only LoggingDispatchSink, "
-        "so nothing spawns until a real DispatchSink is chosen (see ARMING.md).",
+        "Default: DISARMED. Even armed, the default sink is LoggingDispatchSink "
+        "(logs only); pass --sink github-actions to wire the real spawn runtime "
+        "(still gated on armed+live+soak — see ARMING.md).",
     )
     parser.add_argument(
         "--live",
@@ -774,6 +928,50 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "(the counter persists in the state blob). The first N armed ticks record "
         "their would-dispatch decision for review; only tick N+1 can go live — so "
         "a cold armed tick never dispatches. Env: LOOP_SOAK_TICKS (default 0).",
+    )
+    parser.add_argument(
+        "--sink",
+        choices=["logging", "github-actions"],
+        default=os.environ.get("LOOP_SINK", "logging"),
+        help="Which dispatch sink to wire. 'logging' (default, safe) records the "
+        "contract and spawns nothing. 'github-actions' wires the REAL "
+        "GitHubActionsDispatchSink, which triggers loop-implement.yml via "
+        "workflow_dispatch — reached ONLY on the runner's armed+live+past-soak "
+        "path, and requires LOOP_DISPATCH_TOKEN + --dispatch-repo. Env: LOOP_SINK.",
+    )
+    parser.add_argument(
+        "--dispatch-repo",
+        default=os.environ.get("LOOP_DISPATCH_REPO"),
+        help="Orchestrator repo (owner/name) hosting loop-implement.yml, for the "
+        "github-actions sink. Env: LOOP_DISPATCH_REPO.",
+    )
+    parser.add_argument(
+        "--dispatch-workflow",
+        default=os.environ.get("LOOP_DISPATCH_WORKFLOW", "loop-implement.yml"),
+        help="Workflow file the github-actions sink dispatches. Env: "
+        "LOOP_DISPATCH_WORKFLOW (default loop-implement.yml).",
+    )
+    parser.add_argument(
+        "--dispatch-ref",
+        default=os.environ.get("LOOP_DISPATCH_REF", "main"),
+        help="Git ref the dispatched workflow runs on. Env: LOOP_DISPATCH_REF "
+        "(default main).",
+    )
+    parser.add_argument(
+        "--dispatch-api-url",
+        default=os.environ.get("GITHUB_API_URL", "https://api.github.com"),
+        help="GitHub REST API base. Env: GITHUB_API_URL (GHES override).",
+    )
+    parser.add_argument(
+        "--enable-auto-merge",
+        action="store_true",
+        default=os.environ.get("LOOP_ENABLE_AUTO_MERGE") == "true",
+        help="H1 opt-in: let the github-actions sink pass enable-auto-merge=true "
+        "to loop-implement.yml, so the executor MAY auto-merge a PRODUCT-repo PR "
+        "(core repos still take n+1 review). Honoured ONLY on the armed+live "
+        "dispatch path — loop-dispatch.yml passes it ONLY on the go-live tick; "
+        "without it (the default) every dispatched run opens a review PR. Env: "
+        "LOOP_ENABLE_AUTO_MERGE.",
     )
     parser.add_argument(
         "--json",
@@ -815,6 +1013,45 @@ def _build_runner(
         soak_ticks=args.soak_ticks,
     )
     return runner, governor
+
+
+def _build_sink(args: argparse.Namespace) -> DispatchSink:
+    """Resolve the dispatch sink from the CLI.
+
+    Default is the SAFE :class:`LoggingDispatchSink` (records, spawns nothing).
+    ``--sink github-actions`` wires the REAL :class:`GitHubActionsDispatchSink`,
+    which the caller (loop-dispatch.yml) only passes on the go-live path — a
+    belt-and-suspenders selection on top of the runner's own armed+live+soak gate.
+    The real sink is fail-CLOSED to build: it needs the App dispatch token (env
+    ``LOOP_DISPATCH_TOKEN``, minted secret-free via WIF+KV) and the orchestrator
+    repo, or the CLI refuses rather than silently degrading to a no-op."""
+    if args.sink == "github-actions":
+        token = os.environ.get("LOOP_DISPATCH_TOKEN", "")
+        if not token:
+            raise SystemExit(
+                "loop_runner: --sink github-actions requires LOOP_DISPATCH_TOKEN "
+                "(the bot App installation token, minted secret-free via WIF+KV). "
+                "Refusing to run the real sink without it."
+            )
+        if not args.dispatch_repo:
+            raise SystemExit(
+                "loop_runner: --sink github-actions requires --dispatch-repo "
+                "(the owner/name hosting loop-implement.yml)."
+            )
+        # H1: auto-merge is opt-in AND only ever on the armed+live path. Even if
+        # --enable-auto-merge is passed, it does NOT propagate unless this is the
+        # armed live dispatch — belt-and-suspenders with the workflow's own FALSE
+        # default, so nothing but the go-live tick can ever set enable-auto-merge.
+        enable_auto_merge = bool(args.enable_auto_merge and args.armed and args.live)
+        return GitHubActionsDispatchSink(
+            token=token,
+            repo=args.dispatch_repo,
+            workflow=args.dispatch_workflow,
+            ref=args.dispatch_ref,
+            api_url=args.dispatch_api_url,
+            enable_auto_merge=enable_auto_merge,
+        )
+    return LoggingDispatchSink()
 
 
 def render_result(result: RunResult) -> str:
@@ -897,8 +1134,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             # Harness red at arm time — leave disarmed; run_once will REFUSE.
             pass
 
-    # The CLI never wires a real spawn sink: even armed + live, it only logs.
-    result = runner.run_once(LoggingDispatchSink(), dry_run=dry_run)
+    # Resolve the sink. Default is the SAFE LoggingDispatchSink (logs only);
+    # --sink github-actions wires the REAL GitHubActionsDispatchSink. The sink is
+    # only ever REACHED on the runner's single armed+live+past-soak path — the
+    # gating in run_once is unchanged, so selecting the real sink cannot itself
+    # dispatch anything unless every guardrail has already opened.
+    sink = _build_sink(args)
+    result = runner.run_once(sink, dry_run=dry_run)
 
     if args.json:
         print(json.dumps(result.to_dict(), indent=2))

@@ -46,6 +46,7 @@ from loop_runner import (  # noqa: E402
     AgentPlatformSink,
     DispatchResult,
     DispatchSink,
+    GitHubActionsDispatchSink,
     GitHubActionsHeadlessSink,
     LinearDelegationSink,
     LoggingDispatchSink,
@@ -452,6 +453,268 @@ class CliTest(unittest.TestCase):
         finally:
             if saved is not None:
                 os.environ["LINEAR_API_KEY"] = saved
+
+
+# --------------------------------------------------------------------------- #
+# The REAL sink: GitHubActionsDispatchSink (workflow_dispatch via injected transport)
+# --------------------------------------------------------------------------- #
+class _FakeTransport:
+    """A fake HTTP transport: records every call, returns a canned (status, body).
+
+    Lets us prove the sink posts the right workflow_dispatch payload with zero
+    network — the same discipline the rest of ``loop/`` keeps."""
+
+    def __init__(self, status: int = 204, body: str = ""):
+        self.status = status
+        self.body = body
+        self.calls: list[dict] = []
+
+    def __call__(self, url: str, body: bytes, headers: dict):
+        self.calls.append({"url": url, "body": body, "headers": headers})
+        return self.status, self.body
+
+
+def _gha_sink(transport, *, token="tok-abc", repo="three-cubes/tc-pipelines"):
+    return GitHubActionsDispatchSink(
+        token=token, repo=repo, workflow="loop-implement.yml", ref="main",
+        api_url="https://api.github.com", transport=transport,
+    )
+
+
+def _contract_for(issue):
+    """Build a real DispatchContract for an issue via a throwaway dispatcher."""
+    dispatcher = Dispatcher(StaticIssueSource([issue]), guardrails_validator=lambda: True)
+    return dispatcher.contract_for(issue)
+
+
+class GitHubActionsDispatchSinkTest(unittest.TestCase):
+    def test_dispatch_posts_workflow_dispatch_payload(self):
+        fake = _FakeTransport(status=204)
+        sink = _gha_sink(fake)
+        contract = _contract_for(
+            _issue(id="SGO-76", description="**Repos:** tc-fitness")
+        )
+        result = sink.dispatch(contract)
+
+        self.assertTrue(result.spawned)
+        self.assertEqual(result.sink, "github-actions")
+        self.assertEqual(result.issue_id, "SGO-76")
+        self.assertIsNotNone(result.ref)
+
+        self.assertEqual(len(fake.calls), 1)
+        call = fake.calls[0]
+        self.assertEqual(
+            call["url"],
+            "https://api.github.com/repos/three-cubes/tc-pipelines/actions/"
+            "workflows/loop-implement.yml/dispatches",
+        )
+        payload = json.loads(call["body"].decode())
+        self.assertEqual(payload["ref"], "main")
+        self.assertEqual(payload["inputs"]["issue-id"], "SGO-76")
+        self.assertEqual(payload["inputs"]["repo"], "tc-fitness")
+        self.assertIn("issue-branch", payload["inputs"])
+
+    def test_dispatch_maps_contract_fields_to_inputs(self):
+        fake = _FakeTransport()
+        sink = _gha_sink(fake)
+        contract = _contract_for(
+            _issue(id="SGO-88", description="**Repos:** kairix")
+        )
+        sink.dispatch(contract)
+        inputs = json.loads(fake.calls[0]["body"].decode())["inputs"]
+        self.assertEqual(inputs["issue-id"], contract.issue_id)
+        self.assertEqual(inputs["issue-branch"], contract.branch)
+        self.assertEqual(inputs["repo"], contract.repo)
+
+    def test_dispatch_defaults_enable_auto_merge_false(self):
+        # H1: a sink built WITHOUT the opt-in sends enable-auto-merge="false", so
+        # the executor opens a review PR and never auto-merges.
+        fake = _FakeTransport()
+        sink = _gha_sink(fake)  # default enable_auto_merge=False
+        sink.dispatch(_contract_for(_issue(id="SGO-76", description="**Repos:** kairix")))
+        inputs = json.loads(fake.calls[0]["body"].decode())["inputs"]
+        self.assertEqual(inputs["enable-auto-merge"], "false")
+
+    def test_dispatch_passes_enable_auto_merge_true_when_opted_in(self):
+        # H1: the ONLY way enable-auto-merge="true" reaches the workflow is a sink
+        # explicitly built with the opt-in (the armed+live path — see _build_sink).
+        fake = _FakeTransport()
+        sink = GitHubActionsDispatchSink(
+            token="tok-abc", repo="three-cubes/tc-pipelines",
+            workflow="loop-implement.yml", ref="main",
+            api_url="https://api.github.com", transport=fake,
+            enable_auto_merge=True,
+        )
+        sink.dispatch(_contract_for(_issue(id="SGO-76", description="**Repos:** kairix")))
+        inputs = json.loads(fake.calls[0]["body"].decode())["inputs"]
+        self.assertEqual(inputs["enable-auto-merge"], "true")
+
+    def test_dispatch_sends_bearer_token_and_api_headers(self):
+        fake = _FakeTransport()
+        sink = _gha_sink(fake, token="tok-XYZ")
+        sink.dispatch(_contract_for(_issue(id="SGO-76")))
+        headers = fake.calls[0]["headers"]
+        self.assertEqual(headers["Authorization"], "Bearer tok-XYZ")
+        self.assertEqual(headers["Accept"], "application/vnd.github+json")
+        self.assertEqual(headers["X-GitHub-Api-Version"], "2022-11-28")
+
+    def test_non_2xx_fails_closed_raises(self):
+        fake = _FakeTransport(status=404, body='{"message":"Not Found"}')
+        sink = _gha_sink(fake)
+        with self.assertRaises(RuntimeError):
+            sink.dispatch(_contract_for(_issue(id="SGO-76")))
+
+    def test_rejects_injection_in_branch_without_calling_transport(self):
+        fake = _FakeTransport()
+        sink = _gha_sink(fake)
+        contract = _contract_for(_issue(id="SGO-76"))
+        # A branch carrying shell/HTTP metacharacters must never reach a request.
+        poisoned = contract.__class__(**{**contract.to_dict(), "branch": "main;rm -rf /"})
+        with self.assertRaises(ValueError):
+            sink.dispatch(poisoned)
+        self.assertEqual(fake.calls, [])  # transport never touched
+
+    def test_rejects_bad_issue_id(self):
+        fake = _FakeTransport()
+        sink = _gha_sink(fake)
+        contract = _contract_for(_issue(id="SGO-76"))
+        poisoned = contract.__class__(**{**contract.to_dict(), "issue_id": "SGO 76 && curl evil"})
+        with self.assertRaises(ValueError):
+            sink.dispatch(poisoned)
+        self.assertEqual(fake.calls, [])
+
+    def test_rejects_unresolved_target_repo(self):
+        fake = _FakeTransport()
+        sink = _gha_sink(fake)
+        contract = _contract_for(_issue(id="SGO-76"))
+        poisoned = contract.__class__(**{**contract.to_dict(), "repo": "unknown"})
+        with self.assertRaises(ValueError):
+            sink.dispatch(poisoned)
+        self.assertEqual(fake.calls, [])
+
+    def test_missing_token_fails_closed(self):
+        fake = _FakeTransport()
+        sink = _gha_sink(fake, token="")
+        with self.assertRaises(ValueError):
+            sink.dispatch(_contract_for(_issue(id="SGO-76")))
+        self.assertEqual(fake.calls, [])
+
+    def test_satisfies_the_protocol(self):
+        self.assertIsInstance(_gha_sink(_FakeTransport()), DispatchSink)
+
+
+# --------------------------------------------------------------------------- #
+# H1 — _build_sink enables auto-merge ONLY on the armed+live dispatch path.
+# --------------------------------------------------------------------------- #
+class BuildSinkAutoMergeTest(unittest.TestCase):
+    """The sink factory is the choke point for the auto-merge opt-in: even with
+    --enable-auto-merge passed, it must only propagate to the real sink when the
+    tick is armed AND live — belt-and-suspenders with the workflow default."""
+
+    def _sink_for(self, argv):
+        args = runner_mod.build_arg_parser().parse_args(argv)
+        return runner_mod._build_sink(args)
+
+    def test_armed_live_opt_in_enables_auto_merge(self):
+        with mock.patch.dict(os.environ, {"LOOP_DISPATCH_TOKEN": "tok"}, clear=False):
+            sink = self._sink_for([
+                "--sink", "github-actions",
+                "--dispatch-repo", "three-cubes/tc-pipelines",
+                "--armed", "--live", "--enable-auto-merge",
+            ])
+        self.assertIsInstance(sink, GitHubActionsDispatchSink)
+        self.assertTrue(sink.enable_auto_merge)
+
+    def test_opt_in_without_live_does_not_enable_auto_merge(self):
+        # --enable-auto-merge passed, but NOT live: must NOT propagate.
+        with mock.patch.dict(os.environ, {"LOOP_DISPATCH_TOKEN": "tok"}, clear=False):
+            sink = self._sink_for([
+                "--sink", "github-actions",
+                "--dispatch-repo", "three-cubes/tc-pipelines",
+                "--armed", "--enable-auto-merge",
+            ])
+        self.assertFalse(sink.enable_auto_merge)
+
+    def test_armed_live_without_opt_in_does_not_enable_auto_merge(self):
+        with mock.patch.dict(os.environ, {"LOOP_DISPATCH_TOKEN": "tok"}, clear=False):
+            sink = self._sink_for([
+                "--sink", "github-actions",
+                "--dispatch-repo", "three-cubes/tc-pipelines",
+                "--armed", "--live",
+            ])
+        self.assertFalse(sink.enable_auto_merge)
+
+    def test_logging_sink_never_carries_auto_merge(self):
+        # The default (safe) sink has no auto-merge concept; the flag is inert.
+        sink = self._sink_for(["--enable-auto-merge", "--armed", "--live"])
+        self.assertIsInstance(sink, LoggingDispatchSink)
+
+
+# --------------------------------------------------------------------------- #
+# The runner still REFUSES to reach the real sink off the single dispatch path.
+# --------------------------------------------------------------------------- #
+def _real_sink_runner(issues, *, soak_ticks=0, validator=lambda: True, armed=True):
+    """A runner over a static source wired with a real GitHubActionsDispatchSink
+    (fake transport), so we can prove the runner's gate — not the sink — is what
+    keeps the workflow_dispatch from firing."""
+    dispatcher = Dispatcher(StaticIssueSource(issues), guardrails_validator=validator)
+    governor = Governor(None)
+    if armed:
+        try:
+            governor.arm(guardrails_validated=validator())
+        except Exception:
+            pass
+    runner = Runner(
+        dispatcher, governor, guardrails_validator=validator, soak_ticks=soak_ticks
+    )
+    fake = _FakeTransport(status=204)
+    sink = _gha_sink(fake)
+    return runner, sink, fake
+
+
+class RealSinkGatingTest(unittest.TestCase):
+    def test_disarmed_never_reaches_real_sink(self):
+        runner, sink, fake = _real_sink_runner([_issue(id="SGO-76")], armed=False)
+        res = runner.run_once(sink, dry_run=False)  # live, but disarmed
+        self.assertEqual(res.decision, RunDecision.RECORDED)
+        self.assertFalse(res.dispatched)
+        self.assertEqual(fake.calls, [])  # no workflow_dispatch
+
+    def test_dry_run_never_reaches_real_sink(self):
+        runner, sink, fake = _real_sink_runner([_issue(id="SGO-76")])
+        res = runner.run_once(sink, dry_run=True)  # armed, but dry-run
+        self.assertEqual(res.decision, RunDecision.RECORDED)
+        self.assertEqual(fake.calls, [])
+
+    def test_red_harness_refuses_before_real_sink(self):
+        runner, sink, fake = _real_sink_runner(
+            [_issue(id="SGO-76")], validator=lambda: False, armed=False
+        )
+        res = runner.run_once(sink, dry_run=False)
+        self.assertEqual(res.decision, RunDecision.REFUSED)
+        self.assertEqual(fake.calls, [])
+
+    def test_soak_holds_real_sink_until_window_elapses(self):
+        runner, sink, fake = _real_sink_runner([_issue(id="SGO-76")], soak_ticks=2)
+        # First two armed+live ticks stay record-only (the soak).
+        self.assertEqual(runner.run_once(sink, dry_run=False).decision, RunDecision.RECORDED)
+        self.assertEqual(runner.run_once(sink, dry_run=False).decision, RunDecision.RECORDED)
+        self.assertEqual(fake.calls, [])  # nothing dispatched during soak
+        # Tick N+1 finally reaches the real sink.
+        res = runner.run_once(sink, dry_run=False)
+        self.assertEqual(res.decision, RunDecision.DISPATCHED)
+        self.assertTrue(res.spawned)
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_armed_live_past_soak_fires_one_workflow_dispatch(self):
+        runner, sink, fake = _real_sink_runner([_issue(id="SGO-76")])
+        res = runner.run_once(sink, dry_run=False)  # the single dispatch path
+        self.assertEqual(res.decision, RunDecision.DISPATCHED)
+        self.assertTrue(res.spawned)
+        self.assertEqual(res.dispatch_result.sink, "github-actions")
+        self.assertEqual(len(fake.calls), 1)
+        inputs = json.loads(fake.calls[0]["body"].decode())["inputs"]
+        self.assertEqual(inputs["issue-id"], "SGO-76")
 
 
 if __name__ == "__main__":
