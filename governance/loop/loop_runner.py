@@ -31,9 +31,26 @@ so the runtime cannot drift from the spec:
   an injected Linear-adapter snapshot.
 * :mod:`loop_governor` — the runtime that ENFORCES the hard stop-conditions
   (retry ceiling, per-issue + global budget, cross-issue circuit-breaker,
-  determinism admission, lights-out arming). The governor is the authoritative,
-  **cross-tick** budget/retry ledger; the runner consults it *before* selecting
-  and only advances it on a real dispatch.
+  determinism admission, lights-out arming). The governor holds the budget/retry
+  ledger; the runner consults it *before* selecting and only advances it on a
+  real dispatch.
+
+Cross-tick durability (why the guardrails actually bite): every scheduled tick is
+a **fresh process**, so an in-memory-only ledger would reset each tick and the
+retry / budget / circuit-breaker ceilings would NEVER accumulate — the guardrails
+would be inert (fail-open). The runner therefore loads a **durable**
+:class:`~loop_governor.StateStore` (a versioned JSON blob the workflow materialises
+from a dedicated ``loop-state`` git ref / Azure blob — never the evictable Actions
+cache) into the governor at the START of every tick, before any guardrail check,
+and writes it back on the dispatch path. The persisted blob — not process memory —
+is the authoritative cross-tick ledger, so the ceilings trip ACROSS ticks. An
+armed + live tick against a NON-durable store is refused (that would leave the
+guardrails inert). See :class:`~loop_governor.JsonFileStateStore` and ARMING.md.
+
+Soak before live (no cold live tick): even once armed + live, the runner keeps the
+first ``soak_ticks`` armed ticks in record-only mode (the soak counter lives in the
+same durable blob), so an operator reviews the would-dispatch decisions before any
+real dispatch — the very first armed cron tick can never go live.
 
 Determinism note: the determinism guardrail (no ``--reruns`` / network / unpinned
 seed) is a *verification-time* admission (:meth:`Governor` / ``admit_verification``
@@ -92,7 +109,14 @@ from loop_dispatcher import (
     JsonIssueSource,
     guardrails_validated,
 )
-from loop_governor import ContinueAction, Governor
+from loop_governor import (
+    ContinueAction,
+    Governor,
+    JsonFileStateStore,
+    NullStateStore,
+    StateStore,
+    StateStoreError,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -348,6 +372,8 @@ class Runner:
         guardrails_validator: Optional[Callable[[], bool]] = None,
         initiative: str = ADP_INITIATIVE_ID,
         cost_per_issue: float = 1.0,
+        state_store: Optional[StateStore] = None,
+        soak_ticks: int = 0,
     ) -> None:
         self._dispatcher = dispatcher
         self._governor = governor
@@ -360,6 +386,34 @@ class Runner:
         )
         self._initiative = initiative
         self._cost = cost_per_issue
+        # The durable cross-tick ledger. The default is the NON-durable null store
+        # (in-process only) — fine for a single long-lived Governor and for unit
+        # tests, but an armed + live tick requires a durable store (the CLI
+        # refuses the non-durable combination). See FIX 1 / ARMING.md.
+        self._state_store: StateStore = (
+            state_store if state_store is not None else NullStateStore()
+        )
+        # Soak gate (FIX 3): the first ``soak_ticks`` armed ticks stay record-only
+        # even when live is requested, so a cold armed tick never dispatches.
+        self._soak_required = max(0, int(soak_ticks))
+        self._soak_recorded = 0
+
+    @property
+    def state_store(self) -> StateStore:
+        """The durable ledger store this runner loads/persists each tick."""
+        return self._state_store
+
+    def _persist(self) -> None:
+        """Write the governor ledger + soak counter back to the durable store.
+
+        A no-op for the null store; an atomic blob write for the durable store.
+        Called on the dispatch path (after ``record_attempt`` / ``record_cost``)
+        and on an armed record-only tick (to advance the soak counter), so the
+        ledger and the soak window survive process death — the one write per tick
+        that the one-item-per-tick cadence needs."""
+        snap = self._governor.snapshot()
+        snap.soak_ticks = self._soak_recorded
+        self._state_store.save(snap)
 
     # -- the tick ----------------------------------------------------------- #
     def run_once(
@@ -370,24 +424,48 @@ class Runner:
         Order (each earlier gate short-circuits, so a breach can never reach the
         seam):
 
+        0. **Load the durable ledger.** Hydrate the governor from the
+           :class:`~loop_governor.StateStore` BEFORE any guardrail check, so
+           retry/budget/breaker counters (and the soak counter) accumulate across
+           ticks. An unreadable durable blob is fail-CLOSED → ``REFUSED``.
         1. **Self-confirm the guardrail harness** (the ``arm_auto_dispatch``
            precondition, re-checked live). Red → ``REFUSED``, select nothing,
            dispatch nothing.
         2. **Fleet-wide runtime breaker.** If the governor is halted (global
-           budget / cross-issue circuit) → ``HALTED``, dispatch nothing.
+           budget / cross-issue circuit) → ``HALTED``, dispatch nothing. This now
+           reflects the *persisted* breaker state, so a tick opened last cycle
+           halts this cycle too.
         3. **Query READY** via the dispatcher (a pure, side-effect-free view).
            Empty → ``IDLE``.
         4. **Apply the governor before selecting.** Walk the READY queue; the
            first item the governor admits (retry ceiling + per-issue + global
-           budget) is selected. A per-issue breach skips that item; a global
-           breach → ``HALTED``.
+           budget, all read from the persisted ledger) is selected. A per-issue
+           breach skips that item; a global breach → ``HALTED``.
         5. **Record the contract** for the selected item — always, even when it
            is not dispatched.
-        6. **Dispatch only when armed AND not dry_run.** Otherwise ``RECORDED``
-           (dry-run / disarmed, the safe default). When armed AND live, invoke
-           ``sink.dispatch`` (still only logs with the default sink) and advance
-           the governor's cross-tick ledger.
+        6. **Dispatch only when armed AND not dry_run AND past the soak window.**
+           Otherwise ``RECORDED`` (dry-run / disarmed / soaking, the safe
+           default). When it does dispatch, it advances the governor ledger and
+           **persists it before** invoking ``sink.dispatch`` (so an attempt is
+           durably counted even if the spawn crashes — fail-closed).
         """
+        # (0) DURABLE LEDGER — load first so every guardrail below sees the
+        #     accumulated cross-tick state. Fail CLOSED on an unreadable blob.
+        try:
+            persisted = self._state_store.load()
+        except StateStoreError as exc:
+            return self._result(
+                RunDecision.REFUSED,
+                f"durable loop-state is unreadable ({exc}) — refusing the tick "
+                "rather than running on a reset ledger (which would fail open)",
+                armed=self._governor.armed,
+                harness_ok=False,
+                dry_run=dry_run,
+            )
+        if persisted is not None:
+            self._governor.restore(persisted)
+            self._soak_recorded = persisted.soak_ticks
+
         armed = self._governor.armed
         harness_ok = bool(self._validator())
 
@@ -460,10 +538,29 @@ class Runner:
         # (5) Record the contract — always, even if we will not dispatch it.
         contract = self._dispatcher.contract_for(selected)
 
-        # (6) Dispatch ONLY when armed AND not dry_run. Every other path records
-        #     the contract and stops (the safe default).
-        if dry_run or not armed:
-            why = "dry-run" if dry_run else "auto-dispatch not armed (lights-out gate closed)"
+        # (6) Dispatch ONLY when armed AND not dry_run AND past the soak window.
+        #     Every other path records the contract and stops (the safe default).
+        #     The soak gate (FIX 3) keeps the first ``soak_required`` armed ticks
+        #     record-only even when live is requested, so an operator reviews the
+        #     would-dispatch decisions before any real dispatch — a cold armed
+        #     tick can never go live.
+        in_soak = armed and not dry_run and self._soak_recorded < self._soak_required
+        if dry_run or not armed or in_soak:
+            if in_soak:
+                why = (
+                    f"soak window ({self._soak_recorded + 1} of {self._soak_required} "
+                    "armed record-only ticks before live dispatch)"
+                )
+            elif dry_run:
+                why = "dry-run"
+            else:
+                why = "auto-dispatch not armed (lights-out gate closed)"
+            # An armed record-only tick advances + persists the soak counter, so
+            # the soak window elapses across process boundaries. A disarmed tick
+            # never touches the durable state (a pure preview).
+            if armed:
+                self._soak_recorded += 1
+                self._persist()
             return self._result(
                 RunDecision.RECORDED,
                 f"recorded the dispatch contract for {contract.issue_id} but did "
@@ -476,11 +573,14 @@ class Runner:
                 contract=contract,
             )
 
-        # armed AND not dry_run — the ONLY path that reaches the spawn seam.
-        # Advance the governor's cross-tick ledger (attempt + projected spend)
-        # so budgets/retries accumulate and eventually trip across ticks.
+        # armed AND not dry_run AND soak satisfied — the ONLY path that reaches
+        # the spawn seam. Advance the governor's cross-tick ledger (attempt +
+        # projected spend) and PERSIST it BEFORE handing off to the sink, so the
+        # attempt/cost is durably counted even if the spawn crashes (fail-closed:
+        # a lost spawn counts against the retry ceiling, never re-runs free).
         self._governor.record_attempt(contract.issue_id)
         self._governor.record_cost(contract.issue_id, self._cost)
+        self._persist()
         dispatch_result = sink.dispatch(contract)
         return self._result(
             RunDecision.DISPATCHED,
@@ -580,6 +680,27 @@ def _source_from(issues_file: Optional[str]) -> Optional[IssueSource]:
     return None
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read a non-negative int from the environment, tolerating unset/blank."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return max(0, int(raw.strip()))
+    except ValueError:
+        return default
+
+
+def _state_store_from(state_file: Optional[str]) -> StateStore:
+    """A DURABLE :class:`JsonFileStateStore` when a state file is configured, else
+    the non-durable :class:`NullStateStore`. The workflow always passes a state
+    file (materialised from the ``loop-state`` git ref), so a scheduled tick is
+    always durable; an armed + live tick against the null store is refused."""
+    if state_file:
+        return JsonFileStateStore(Path(state_file))
+    return NullStateStore()
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="loop_runner",
@@ -637,6 +758,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "the dispatch seam. Default: DRY-RUN (record-only, no side effects).",
     )
     parser.add_argument(
+        "--state-file",
+        default=os.environ.get("LOOP_STATE_FILE"),
+        help="Path to the DURABLE governor-ledger blob (versioned JSON). The "
+        "workflow materialises it from the dedicated `loop-state` git ref so the "
+        "retry/budget/circuit-breaker counters accumulate ACROSS ticks. Omitted "
+        "-> a NON-durable in-process ledger; an armed+live tick then REFUSES "
+        "(guardrails would be inert). Env: LOOP_STATE_FILE.",
+    )
+    parser.add_argument(
+        "--soak-ticks",
+        type=int,
+        default=_env_int("LOOP_SOAK_TICKS", 0),
+        help="Number of armed record-only ticks to SOAK before any live dispatch "
+        "(the counter persists in the state blob). The first N armed ticks record "
+        "their would-dispatch decision for review; only tick N+1 can go live — so "
+        "a cold armed tick never dispatches. Env: LOOP_SOAK_TICKS (default 0).",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Emit the run result as JSON instead of the human-readable view.",
@@ -645,11 +784,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _build_runner(
-    args: argparse.Namespace, source: IssueSource, validator: Callable[[], bool]
+    args: argparse.Namespace,
+    source: IssueSource,
+    validator: Callable[[], bool],
+    state_store: StateStore,
 ) -> tuple[Runner, Governor]:
     """Assemble a dispatcher + governor + runner that all share one harness proof
     (``validator``), so the harness is run at most once per tick and the runner's
-    self-check cannot disagree with the dispatcher's arming."""
+    self-check cannot disagree with the dispatcher's arming. The ``state_store`` is
+    the durable cross-tick ledger the runner loads at tick start and persists on
+    the dispatch path."""
     config = governor_mod.loop.GuardrailConfig(
         per_issue_budget=args.per_issue_budget,
         global_budget=args.global_budget,
@@ -667,6 +811,8 @@ def _build_runner(
         guardrails_validator=validator,
         initiative=args.initiative,
         cost_per_issue=args.cost,
+        state_store=state_store,
+        soak_ticks=args.soak_ticks,
     )
     return runner, governor
 
@@ -702,6 +848,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
     dry_run = not args.live
 
+    # The durable cross-tick ledger. An armed + LIVE tick MUST run against a
+    # durable store — otherwise the retry/budget/circuit-breaker counters reset
+    # every tick and the guardrails are inert (fail-OPEN). Refuse that combination
+    # up front (exit non-zero so a scheduled tick surfaces the misconfiguration).
+    state_store = _state_store_from(args.state_file)
+    if args.armed and args.live and not state_store.durable:
+        msg = (
+            "loop-runner: REFUSED — an armed + live tick requires a DURABLE state "
+            "store (pass --state-file / set LOOP_STATE_FILE). Without it the "
+            "governor ledger resets every tick and the retry/budget/circuit-"
+            "breaker guardrails never accumulate (fail-open). Nothing dispatched."
+        )
+        if args.json:
+            print(json.dumps({"decision": "refused", "reason": msg, "armed": True}, indent=2))
+        else:
+            print(msg)
+        return 3
+
     source = _source_from(args.issues_file)
     if source is None:
         # No source wired. A dry-run tick stays green (documented skip, mirroring
@@ -723,7 +887,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     harness_ok = guardrails_validated()
     validator: Callable[[], bool] = lambda: harness_ok  # noqa: E731 - a tiny memoised proof
 
-    runner, governor = _build_runner(args, source, validator)
+    runner, governor = _build_runner(args, source, validator, state_store)
 
     # Arming is a deliberate act, and STILL refused unless the harness validates.
     if args.armed:

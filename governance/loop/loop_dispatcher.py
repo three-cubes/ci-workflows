@@ -439,27 +439,64 @@ def ready_queue(issues: Iterable[CandidateIssue]) -> list[CandidateIssue]:
 # --------------------------------------------------------------------------- #
 # Guardrail validation — the lights-out gate proof
 # --------------------------------------------------------------------------- #
+#: The guardrail harness (``test_loop_guardrails.py``) asserts every hard
+#: STOP-CONDITION actually fires. It currently has 25 such tests; this floor
+#: guards against a truncated / renamed / half-deleted harness reading as
+#: vacuously green. Empty discovery (a missing/renamed file) collects 0 tests,
+#: and ``TestResult.wasSuccessful()`` is ``True`` for an EMPTY run — so a count
+#: floor is the only thing that stops "no harness" from arming the loop.
+MIN_GUARDRAIL_TESTS = 20
+
+
 def guardrails_validated(
     *,
     test_dir: Optional[Path] = None,
     pattern: str = "test_loop_guardrails.py",
     verbosity: int = 0,
+    min_tests: int = MIN_GUARDRAIL_TESTS,
 ) -> bool:
-    """Run the guardrail harness and report whether it is green.
+    """Run the guardrail harness and report whether it is green — FAIL CLOSED.
 
     This IS the proof :meth:`loop_state_machine.LoopEngine.arm_auto_dispatch`
     demands: auto-dispatch may not arm unless the guardrails are proven to fire.
     Runs the ``governance/loop/tests`` guardrail harness in-process (stdlib
-    ``unittest``, no network), returning ``True`` only on a fully-green run. It
-    targets the guardrail-validation module specifically (the lights-out gate),
-    not the dispatcher's own tests, so a CLI invocation does not re-enter itself.
+    ``unittest``, no network). It targets the guardrail-validation module
+    specifically (the lights-out gate), not the dispatcher's own tests, so a CLI
+    invocation does not re-enter itself.
+
+    Fail-closed, not fail-open: ``wasSuccessful()`` alone is a trap because an
+    EMPTY run (the harness file missing/renamed, or discovery collecting nothing)
+    reports success vacuously — arming on a harness that was silently deleted.
+    So this returns ``True`` only when ALL of:
+
+    * the harness file actually EXISTS under ``test_dir`` (matching ``pattern``);
+    * discovery collected **at least ``min_tests``** guardrail tests (a
+      truncated/renamed harness collects fewer — or zero — and is rejected); and
+    * that run was fully green.
+
+    Any of those failing → ``False`` → the loop cannot arm.
     """
-    test_dir = test_dir or (Path(__file__).resolve().parent / "tests")
+    test_dir = Path(test_dir) if test_dir is not None else (
+        Path(__file__).resolve().parent / "tests"
+    )
+    # FAIL CLOSED (1): the harness FILE must exist. A missing/renamed harness must
+    # never read as green — check before discovery even runs.
+    if not test_dir.is_dir() or not any(test_dir.rglob(pattern)):
+        return False
+
     loader = unittest.TestLoader()
     suite = loader.discover(start_dir=str(test_dir), pattern=pattern)
+
+    # FAIL CLOSED (2): reject zero / fewer-than-expected guardrail tests. Empty or
+    # truncated discovery cannot vacuously arm the loop.
+    collected = suite.countTestCases()
+    if collected < min_tests:
+        return False
+
     with open(os.devnull, "w", encoding="utf-8") as sink:
         result = unittest.TextTestRunner(stream=sink, verbosity=verbosity).run(suite)
-    return result.wasSuccessful()
+    # FAIL CLOSED (3): green AND enough tests actually ran.
+    return result.wasSuccessful() and result.testsRun >= min_tests
 
 
 # --------------------------------------------------------------------------- #

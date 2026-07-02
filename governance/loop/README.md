@@ -69,20 +69,29 @@ The machine-checkable half of the canonical spec
 - [`loop_runner.py`](loop_runner.py) — the **continuous-dispatch driver** (the runner), the piece
   that replaces the human hand-cranking the loop. On a cadence (the scheduled
   [`loop-dispatch.yml`](../../.github/workflows/loop-dispatch.yml) workflow) `Runner.run_once(sink,
-  dry_run)` (1) refuses unless the governor is armed **and** the guardrail harness re-validates this
-  tick; (2) queries READY via `loop_dispatcher`; (3) applies the **governor** (retry ceiling,
-  per-issue + global budget, cross-issue circuit-breaker) BEFORE selecting; (4) selects the next
-  item; (5) if `dry_run` OR not armed, **records** the `DispatchContract` and dispatches nothing;
-  (6) only when armed AND not dry-run hands it to `sink.dispatch`. Every guardrail breach
-  short-circuits to `REFUSED` / `HALTED` — never dispatch. The spawn seam is a pluggable
-  `DispatchSink`; the safe default (`LoggingDispatchSink`) records the contract and **spawns
-  nothing**, and three documented STUB sinks (`GitHubActionsHeadlessSink`, `AgentPlatformSink`,
-  `LinearDelegationSink`) are the candidate runtimes the org will choose between (none implemented
-  yet — each raises `NotImplementedError`). See [`ARMING.md`](ARMING.md) for the arm / disarm /
-  kill-switch / escalation runbook.
+  dry_run)` (0) loads the **durable** governor ledger from a `StateStore` (the `loop-state` git ref)
+  BEFORE any guardrail check, so retry/budget/breaker counters accumulate ACROSS the fresh-process
+  ticks; (1) refuses unless the governor is armed **and** the guardrail harness re-validates this
+  tick (fail-closed — a missing/renamed harness is not green); (2) queries READY via
+  `loop_dispatcher`; (3) applies the **governor** (retry ceiling, per-issue + global budget,
+  cross-issue circuit-breaker) BEFORE selecting; (4) selects the next item; (5) records the
+  `DispatchContract`; (6) dispatches only when armed AND not dry-run AND **past the soak window**,
+  persisting the ledger before handing it to `sink.dispatch`. Every guardrail breach short-circuits
+  to `REFUSED` / `HALTED` — never dispatch. The spawn seam is a pluggable `DispatchSink`; the safe
+  default (`LoggingDispatchSink`) records the contract and **spawns nothing**, and three documented
+  STUB sinks (`GitHubActionsHeadlessSink`, `AgentPlatformSink`, `LinearDelegationSink`) are the
+  candidate runtimes the org will choose between (none implemented yet — each raises
+  `NotImplementedError`). See [`ARMING.md`](ARMING.md) for the arm / soak / disarm / kill-switch /
+  escalation runbook.
 - [`tests/test_loop_runner.py`](tests/test_loop_runner.py) — the runner tests, including the
   fail-safe cases (disarmed, red harness, per-issue/global budget breach, dry-run → **no dispatch**;
   armed + logging sink → the seam is reached but **logs only**) and the CLI.
+- [`tests/test_loop_hardening.py`](tests/test_loop_hardening.py) — the enforceability proofs: the
+  retry ceiling, per-issue + global budget, and cross-issue circuit-breaker all trip **across
+  separate fresh-process ticks** through the durable `JsonFileStateStore` (with a control showing
+  the non-durable store never trips); `guardrails_validated` fails **closed** on a missing / renamed
+  / truncated harness; and the **soak** keeps the first N armed ticks record-only so a cold armed
+  tick never dispatches.
 
 ## Dispatcher CLI (`--dry-run` — the bootstrap-phase view)
 

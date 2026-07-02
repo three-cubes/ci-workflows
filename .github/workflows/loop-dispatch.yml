@@ -5,24 +5,36 @@ name: loop-dispatch
 # · decision D5: the loop lives in committed GitHub-Actions event-dispatch). This
 # is the piece that replaces the human hand-cranking the loop: on a cadence it
 # runs `governance/loop/loop_runner.py`, which self-selects the next READY work
-# item, guardrail-gates it through the governor, and — only when ARMED and LIVE —
-# hands it to a dispatch sink.
+# item, guardrail-gates it through the governor, and — only when ARMED and LIVE
+# and past the SOAK window — hands it to a dispatch sink.
 #
 # FAIL-SAFE BY CONSTRUCTION:
 #   * DRY-RUN by default. Every tick runs the runner in dry-run (record-only):
 #     it LOGS the selection it WOULD dispatch and dispatches NOTHING.
-#   * It may move past dry-run ONLY when the repo variable LOOP_ARMED == "true"
-#     AND the runner self-confirms the guardrail harness validates THIS tick
-#     (arm_auto_dispatch precondition). Two independent gates, both required.
-#   * Even fully armed + live, the runner CLI wires ONLY the LoggingDispatchSink
-#     (the safe default) — so it STILL only logs. The real agent-spawn seam is
-#     intentionally NOT connected here; wiring a real DispatchSink is a separate,
-#     deliberate change (see governance/loop/ARMING.md). Arming is therefore
+#   * It may move past dry-run ONLY when repo var LOOP_ARMED == "true" AND the
+#     runner self-confirms the guardrail harness validates THIS tick
+#     (arm_auto_dispatch precondition) AND the operator has set the SECOND key
+#     LOOP_LIVE == "true". Three gates for a scheduled live tick.
+#   * SOAK before live (FIX 3): even armed + live, the runner keeps the first
+#     LOOP_SOAK_TICKS armed ticks record-only — the very first armed tick can
+#     never dispatch. The soak counter lives in the durable ledger (below), so
+#     the window elapses across ticks.
+#   * DURABLE cross-tick ledger (FIX 1): the governor's retry/budget/circuit-
+#     breaker counters are persisted to a dedicated `loop-state` git ref (NOT the
+#     evictable Actions cache) — restored before the runner and written back
+#     after — so the guardrails actually accumulate and trip ACROSS ticks. Each
+#     tick is a fresh process; without this the ceilings would reset every tick
+#     and be inert. An armed + live tick refuses to run without the durable file.
+#   * Even fully armed + live + past soak, the runner CLI wires ONLY the
+#     LoggingDispatchSink (the safe default) — so it STILL only logs. The real
+#     agent-spawn seam is intentionally NOT connected here; wiring a real
+#     DispatchSink is a separate, deliberate change AND is gated on FIX 1/2/3
+#     being in place (see governance/loop/ARMING.md). Arming is therefore
 #     currently safe: there is no runtime that could spawn.
 #
-# KILL-SWITCH: set repo variable LOOP_ARMED to anything but "true" (or disable
-# this workflow). Takes effect on the next tick — no in-flight spawn to stop,
-# because nothing spawns yet.
+# KILL-SWITCH: set repo variable LOOP_ARMED (or LOOP_LIVE) to anything but "true"
+# (or disable this workflow). Takes effect on the next tick — no in-flight spawn
+# to stop, because nothing spawns yet.
 #
 # SECRET-FREE Linear read (recommended path, mirrors verify-and-close.yml): when
 # repo variable LOOP_LINEAR_KEY_VAULT names an Azure Key Vault, the job federates
@@ -35,8 +47,7 @@ name: loop-dispatch
 # env-bound before it reaches the shell body (never interpolated into a `run:`
 # string), and the Key Vault name + secret name reach `az keyvault secret show`
 # as env values, never spliced into the command. Third-party actions are
-# SHA-pinned. Least privilege: the job reads Linear + logs; it needs no write
-# scope on GitHub.
+# SHA-pinned.
 #
 # Part of the Autonomous Delivery Platform initiative (SP-C).
 
@@ -51,15 +62,19 @@ on:
         description: >-
           Force dry-run (record-only) even if LOOP_ARMED=true. Default true, so a
           MANUAL run is dry-run unless you explicitly set this false AND the repo
-          is armed. Scheduled ticks ignore this and go live only when armed.
+          is armed AND LOOP_LIVE=true. Scheduled ticks ignore this and go live
+          only when armed + LOOP_LIVE + past the soak window.
         type: boolean
         default: true
 
-# Least privilege: id-token for the WIF federation (the secret-free KV read),
-# contents:read for the checkout. No write scopes — the runner only reads Linear
-# and logs; it never pushes, comments, or transitions anything.
+# Least privilege: id-token for the WIF federation (the secret-free KV read), and
+# contents:write scoped in PRACTICE to a SINGLE thing — updating the dedicated
+# `loop-state` ledger ref (refs/loop-state/ledger), an orphan ref outside any
+# branch. The steps below NEVER push code, branches, or tags; the write scope
+# exists only so the durable cross-tick governor ledger (FIX 1) survives between
+# the fresh-process ticks. The runner still performs NO GitHub writes of its own.
 permissions:
-  contents: read
+  contents: write
   id-token: write
 
 # One tick at a time. Never cancel an in-flight tick (it is read-only + short).
@@ -82,6 +97,30 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Restore the loop-state ledger (durable cross-tick governor state)
+        # FIX 1: materialise the durable governor ledger from the dedicated
+        # `loop-state` git ref into a run-local file the runner loads at tick
+        # start. A missing ref is a clean first-ever tick. Injection-safe: the
+        # token is env-bound + masked, never spliced into the run body.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$GH_TOKEN"
+          state_ref="refs/loop-state/ledger"
+          state_file="$RUNNER_TEMP/loop-state.json"
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git fetch --quiet "$remote" "+${state_ref}:${state_ref}" 2>/dev/null; then
+            git cat-file -p "${state_ref}:loop-state.json" > "$state_file" 2>/dev/null \
+              || echo "loop-state ref exists but has no ledger blob yet (fresh)"
+          else
+            echo "no loop-state ref yet — first tick starts from a clean ledger"
+          fi
+          if [[ -f "$state_file" ]]; then
+            echo "restored loop-state ($(wc -c < "$state_file") bytes)"
+          fi
+
       - name: Azure login for Key Vault (WIF — secret-free Linear read)
         # Only when a vault is configured. Federates to Azure via OIDC (no stored
         # credential) so the runner step can read the Linear key from Key Vault at
@@ -93,12 +132,14 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Run the loop runner (dry-run unless LOOP_ARMED=true)
+      - name: Run the loop runner (dry-run unless armed + LOOP_LIVE + past soak)
         # All dynamic values are env-bound (injection-safe); nothing is spliced
         # into the run body. The Linear key is fetched INSIDE this step, masked,
         # and kept a local shell variable — never a job/step output.
         env:
           LOOP_ARMED: ${{ vars.LOOP_ARMED }}
+          LOOP_LIVE: ${{ vars.LOOP_LIVE }}
+          SOAK_TICKS: ${{ vars.LOOP_SOAK_TICKS || '3' }}
           LINEAR_KEY_VAULT: ${{ vars.LOOP_LINEAR_KEY_VAULT }}
           LINEAR_KEY_SECRET_NAME: ${{ vars.LOOP_LINEAR_KEY_SECRET_NAME || 'ci-verify-and-close' }}
           INITIATIVE: ${{ vars.LOOP_INITIATIVE || '7e522d9b-8cb2-45d2-a8ca-4ee6f83d554d' }}
@@ -109,15 +150,22 @@ jobs:
         run: |
           set -euo pipefail
 
+          state_file="$RUNNER_TEMP/loop-state.json"
+
           # --- Arming decision (fail-safe): ONLY the exact string "true" arms. ---
           armed=false
           if [[ "${LOOP_ARMED:-}" == "true" ]]; then armed=true; fi
 
-          # --- Dry-run decision. A tick may go live ONLY when armed. Scheduled
-          #     ticks go live when armed; a MANUAL tick additionally honours the
-          #     dry_run input (default true), so a human must explicitly opt in. ---
+          # --- Dry-run decision. A tick may go live ONLY when armed AND the
+          #     operator has set the SECOND key LOOP_LIVE="true" (after reviewing
+          #     the soak's recorded would-dispatch decisions). A MANUAL tick
+          #     additionally honours the dry_run input (default true), so a human
+          #     must explicitly opt in on top of both repo keys. Even then the
+          #     runner enforces the soak window before any real dispatch. ---
+          live_key=false
+          if [[ "${LOOP_LIVE:-}" == "true" ]]; then live_key=true; fi
           dry_run=true
-          if [[ "$armed" == "true" ]]; then
+          if [[ "$armed" == "true" && "$live_key" == "true" ]]; then
             if [[ "$EVENT_NAME" == "schedule" ]]; then
               dry_run=false
             elif [[ "${REQUEST_DRY_RUN:-true}" == "false" ]]; then
@@ -141,12 +189,15 @@ jobs:
           # --- Build the runner invocation. The CLI wires ONLY LoggingDispatchSink
           #     (no real spawn seam), so even `--armed --live` ONLY LOGS — the
           #     spawn seam is intentionally not connected until the org picks a
-          #     runtime (ARMING.md). The runner ALSO self-confirms the guardrail
-          #     harness this tick and REFUSES (non-zero) if it is red — a second,
-          #     independent gate on top of LOOP_ARMED. The runner is one-item-per-
-          #     tick by design (run_once selects a single READY item); the */30
-          #     cadence is the throttle, so there is no --limit. ---
-          args=(--json --initiative "$INITIATIVE")
+          #     runtime (ARMING.md). The runner ALSO (a) self-confirms the
+          #     guardrail harness this tick and REFUSES (non-zero) if it is red,
+          #     (b) loads/persists the DURABLE ledger via --state-file so the
+          #     ceilings accumulate across ticks, and (c) enforces the SOAK window
+          #     via --soak-ticks. The runner is one-item-per-tick by design
+          #     (run_once selects a single READY item); the */30 cadence is the
+          #     throttle, so there is no --limit. ---
+          args=(--json --initiative "$INITIATIVE"
+                --state-file "$state_file" --soak-ticks "$SOAK_TICKS")
           if [[ "$armed" == "true" ]]; then
             args+=(--armed)
             if [[ "$dry_run" == "false" ]]; then
@@ -154,8 +205,49 @@ jobs:
             fi
           fi
 
-          echo "loop-dispatch: armed=$armed dry_run=$dry_run event=${EVENT_NAME}" \
+          echo "loop-dispatch: armed=$armed live_key=$live_key dry_run=$dry_run" \
+            "soak_ticks=$SOAK_TICKS event=${EVENT_NAME}" \
             "(sink=LoggingDispatchSink — logs only; no runtime wired)"
           echo "::group::loop-runner result"
           python3 -m loop_runner "${args[@]}"
           echo "::endgroup::"
+
+      - name: Persist the loop-state ledger (atomic single-commit to the ref)
+        # FIX 1: write the runner's updated ledger back to the dedicated
+        # `loop-state` git ref as ONE commit — the only write this workflow makes.
+        # Runs even if the runner step failed (so a recorded state is not lost),
+        # but skips cleanly when nothing changed. Injection-safe: token env-bound
+        # + masked; the bot identity authors the commit.
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_AUTHOR_NAME: "three-cubes-agent[bot]"
+          GIT_AUTHOR_EMAIL: "295831460+three-cubes-agent[bot]@users.noreply.github.com"
+          GIT_COMMITTER_NAME: "three-cubes-agent[bot]"
+          GIT_COMMITTER_EMAIL: "295831460+three-cubes-agent[bot]@users.noreply.github.com"
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$GH_TOKEN"
+          state_ref="refs/loop-state/ledger"
+          state_file="$RUNNER_TEMP/loop-state.json"
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if [[ ! -f "$state_file" ]]; then
+            echo "no loop-state to persist (nothing was recorded this tick)"
+            exit 0
+          fi
+          blob="$(git hash-object -w "$state_file")"
+          tree="$(printf '100644 blob %s\tloop-state.json\n' "$blob" | git mktree)"
+          parent="$(git rev-parse -q --verify "$state_ref" 2>/dev/null || true)"
+          if [[ -n "$parent" && "$(git rev-parse "${parent}^{tree}")" == "$tree" ]]; then
+            echo "loop-state unchanged this tick — nothing to persist"
+            exit 0
+          fi
+          if [[ -n "$parent" ]]; then
+            commit="$(git commit-tree "$tree" -p "$parent" -m "loop-state: run ${GITHUB_RUN_ID}")"
+          else
+            commit="$(git commit-tree "$tree" -m "loop-state: init (run ${GITHUB_RUN_ID})")"
+          fi
+          git update-ref "$state_ref" "$commit"
+          git push --quiet "$remote" "${state_ref}:${state_ref}"
+          echo "persisted loop-state to ${state_ref}"

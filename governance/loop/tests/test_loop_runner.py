@@ -387,10 +387,16 @@ class CliTest(unittest.TestCase):
 
     def test_armed_live_over_snapshot_logs_only(self):
         path = self._snapshot([self._issue_doc()])
+        state = os.path.join(tempfile.mkdtemp(), "loop-state.json")
         buf = io.StringIO()
         with mock.patch.object(runner_mod, "guardrails_validated", lambda: True):
             with redirect_stdout(buf):
-                rc = runner_mod.main(["--json", "--armed", "--live", "--issues-file", path])
+                # A durable --state-file is REQUIRED for an armed+live tick (else
+                # the guardrails would be inert). soak_ticks defaults to 0 here.
+                rc = runner_mod.main(
+                    ["--json", "--armed", "--live", "--issues-file", path,
+                     "--state-file", state]
+                )
         self.assertEqual(rc, 0)
         doc = json.loads(buf.getvalue())
         self.assertEqual(doc["decision"], "dispatched")
@@ -398,6 +404,21 @@ class CliTest(unittest.TestCase):
         self.assertTrue(doc["dispatched"])
         self.assertFalse(doc["spawned"])  # CLI wires only LoggingDispatchSink
         self.assertEqual(doc["dispatch_result"]["sink"], "logging")
+
+    def test_armed_live_without_state_file_refuses(self):
+        # FIX 1 fail-closed: an armed+live tick with NO durable store is refused
+        # up front (a non-durable ledger resets every tick -> inert guardrails).
+        path = self._snapshot([self._issue_doc()])
+        buf = io.StringIO()
+        with mock.patch.object(runner_mod, "guardrails_validated", lambda: True):
+            with redirect_stdout(buf):
+                rc = runner_mod.main(
+                    ["--json", "--armed", "--live", "--issues-file", path]
+                )
+        self.assertEqual(rc, 3)
+        doc = json.loads(buf.getvalue())
+        self.assertEqual(doc["decision"], "refused")
+        self.assertIn("durable", doc["reason"].lower())
 
     def test_armed_live_refused_when_harness_red_exits_nonzero(self):
         path = self._snapshot([self._issue_doc()])

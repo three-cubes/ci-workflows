@@ -45,11 +45,14 @@ Run the harness (this module's tests included)::
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional, Protocol
+from typing import Callable, Optional, Protocol, runtime_checkable
 
 # ``loop_state_machine`` is a sibling module (this dir is not a package — the tests
 # use the same path shim). Import it whether we run as a script from the repo root
@@ -184,6 +187,187 @@ class IssueLedger:
 
 
 # --------------------------------------------------------------------------- #
+# Durable state — the process-death-surviving ledger blob (SP-C hardening / FIX 1)
+#
+# Each scheduled cron tick is a FRESH PROCESS. Without a durable ledger the
+# governor's retry / budget / circuit-breaker counters reset every tick, so they
+# NEVER accumulate across ticks and the guardrails are inert (fail-open). The
+# :class:`StateStore` is the fix: the runner loads the persisted ledger at the
+# start of every tick (before ``should_continue``) and writes it back on the
+# dispatch path, so the ceilings actually trip ACROSS process boundaries.
+# --------------------------------------------------------------------------- #
+#: Schema version of the persisted blob. A blob with a different version is a
+#: fail-CLOSED error (never silently reset — that would fail open by forgetting
+#: every accumulated attempt/cost/breaker across ticks).
+STATE_VERSION = 1
+
+
+class StateStoreError(RuntimeError):
+    """A durable loop-state blob was present but unreadable (bad JSON / wrong
+    version). The caller MUST fail closed — refuse the tick — rather than reset
+    the ledger, because a silent reset makes every guardrail forget across ticks
+    (fail-open)."""
+
+
+@dataclass
+class GovernorState:
+    """A durable, process-death-surviving snapshot of the governor ledger.
+
+    Captures everything the cross-tick guardrails need to accumulate: per-issue
+    attempts + cost + failure streak + disposition, the fleet-wide global spend,
+    the cross-issue failure streak, and the open/closed state of the fleet
+    breakers. It also carries the runner's soak counter (``soak_ticks`` — the
+    number of armed dry-run ticks recorded before live dispatch is permitted; see
+    the runner's soak gate) so the whole loop's durable state is one atomic blob.
+
+    Escalation *objects* are intentionally NOT persisted here: they are emitted to
+    the human at escalation time (the verify/close side owns that, idempotently).
+    The ``escalated`` boolean IS persisted, so a re-armed tick still sees an
+    already-escalated issue as terminal (``should_continue`` -> ``ESCALATE``).
+    """
+
+    version: int = STATE_VERSION
+    ledgers: dict = field(default_factory=dict)
+    global_cost: float = 0.0
+    global_tokens: int = 0
+    fleet_failures: int = 0
+    halted: bool = False
+    halt_reason: str = ""
+    circuit_open: bool = False
+    fleet_escalated: bool = False
+    soak_ticks: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "version": self.version,
+            "ledgers": self.ledgers,
+            "global_cost": self.global_cost,
+            "global_tokens": self.global_tokens,
+            "fleet_failures": self.fleet_failures,
+            "halted": self.halted,
+            "halt_reason": self.halt_reason,
+            "circuit_open": self.circuit_open,
+            "fleet_escalated": self.fleet_escalated,
+            "soak_ticks": self.soak_ticks,
+        }
+
+    @classmethod
+    def from_dict(cls, doc: dict) -> "GovernorState":
+        """Rehydrate from a persisted dict, fail-CLOSED on a version it does not
+        understand (a schema bump must be a deliberate migration, never a silent
+        ledger reset)."""
+        version = doc.get("version")
+        if version != STATE_VERSION:
+            raise StateStoreError(
+                f"unsupported loop-state version {version!r} (expected "
+                f"{STATE_VERSION}) — refusing to reset the ledger silently"
+            )
+        return cls(
+            version=STATE_VERSION,
+            ledgers=dict(doc.get("ledgers") or {}),
+            global_cost=float(doc.get("global_cost", 0.0)),
+            global_tokens=int(doc.get("global_tokens", 0)),
+            fleet_failures=int(doc.get("fleet_failures", 0)),
+            halted=bool(doc.get("halted", False)),
+            halt_reason=str(doc.get("halt_reason", "")),
+            circuit_open=bool(doc.get("circuit_open", False)),
+            fleet_escalated=bool(doc.get("fleet_escalated", False)),
+            soak_ticks=int(doc.get("soak_ticks", 0)),
+        )
+
+
+@runtime_checkable
+class StateStore(Protocol):
+    """Where the durable governor ledger lives between ticks.
+
+    ``durable`` is load-bearing: an armed + live tick refuses to run against a
+    NON-durable store (that would leave the guardrails inert). ``load`` returns
+    the persisted :class:`GovernorState`, ``None`` meaning "no persistence — keep
+    whatever is in memory" (the null store), or an empty state for a first-ever
+    tick. ``save`` writes atomically.
+    """
+
+    durable: bool
+
+    def load(self) -> Optional[GovernorState]: ...
+
+    def save(self, state: GovernorState) -> None: ...
+
+
+class NullStateStore:
+    """The non-durable default: no persistence. ``load`` returns ``None`` (keep
+    the in-process ledger untouched — so a single long-lived Governor still
+    accumulates within one process) and ``save`` is a no-op. An armed + live tick
+    MUST NOT use this — the CLI refuses that combination (fail-closed)."""
+
+    durable = False
+
+    def load(self) -> Optional[GovernorState]:
+        return None
+
+    def save(self, state: GovernorState) -> None:
+        return None
+
+
+class JsonFileStateStore:
+    """A durable :class:`StateStore` backed by a single versioned JSON blob.
+
+    Stdlib only, no fragile infra: the workflow materialises this file from a
+    dedicated ``loop-state`` git ref (or an Azure blob via the same WIF identity)
+    at the start of a tick and writes it back at the end. Writes are ATOMIC
+    (temp file in the same dir -> ``fsync`` -> ``os.replace``), so a tick killed
+    mid-write can never leave a torn ledger; a missing/empty file is a clean
+    first-ever tick, and a present-but-corrupt/wrong-version file fails CLOSED
+    (:class:`StateStoreError`) so the ledger is never silently reset.
+    """
+
+    durable = True
+
+    def __init__(self, path) -> None:
+        self.path = Path(path)
+
+    def load(self) -> Optional[GovernorState]:
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return GovernorState()  # first-ever tick — a clean, empty ledger
+        raw = raw.strip()
+        if not raw:
+            return GovernorState()  # empty file (e.g. fresh ref) — clean ledger
+        try:
+            doc = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise StateStoreError(
+                f"loop-state at {self.path} is not valid JSON ({exc}) — refusing "
+                "to reset the ledger; fix or clear the state blob"
+            ) from exc
+        if not isinstance(doc, dict):
+            raise StateStoreError(
+                f"loop-state at {self.path} is not a JSON object — refusing to "
+                "reset the ledger"
+            )
+        return GovernorState.from_dict(doc)
+
+    def save(self, state: GovernorState) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            dir=str(self.path.parent), prefix=".loop-state.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(state.to_dict(), fh, indent=2, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)  # atomic on POSIX
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+# --------------------------------------------------------------------------- #
 # Escalation sink — the injected human hand-off seam
 # --------------------------------------------------------------------------- #
 class EscalationSink(Protocol):
@@ -208,12 +392,16 @@ class RecordingEscalationSink:
 class Governor:
     """Enforces the loop's hard stop-conditions at runtime, cycle by cycle.
 
-    The governor keeps the authoritative per-issue ledger (attempts / cost /
-    tokens / failure streak) and the fleet-wide counters (global spend, cross-issue
-    failure streak). It reuses :class:`LoopEngine` for the two seams that belong to
-    the spec — determinism admission and the lights-out arming gate — and reuses
-    :class:`GuardrailConfig` for every ceiling, so the runtime cannot diverge from
-    the state machine it enforces.
+    The governor keeps the per-issue ledger (attempts / cost / tokens / failure
+    streak) and the fleet-wide counters (global spend, cross-issue failure streak)
+    for the life of a process. Across the fresh-process cron ticks, the
+    AUTHORITATIVE ledger is the durable :class:`GovernorState` blob a
+    :class:`StateStore` persists: :meth:`snapshot` exports it and :meth:`restore`
+    rehydrates it at the start of every tick, so the counters accumulate tick to
+    tick instead of resetting. It reuses :class:`LoopEngine` for the two seams that
+    belong to the spec — determinism admission and the lights-out arming gate — and
+    reuses :class:`GuardrailConfig` for every ceiling, so the runtime cannot diverge
+    from the state machine it enforces.
     """
 
     def __init__(
@@ -275,6 +463,65 @@ class Governor:
     @property
     def escalations(self) -> tuple[Escalation, ...]:
         return tuple(self._escalations)
+
+    # -- durable snapshot / restore (cross-tick ledger — FIX 1) ------------- #
+    def snapshot(self) -> GovernorState:
+        """Export the full ledger as a durable :class:`GovernorState` blob.
+
+        This is what a :class:`StateStore` persists so the counters survive
+        process death. The armed flag is deliberately excluded — arming is
+        re-decided every tick from ``LOOP_ARMED`` + the live harness proof, never
+        trusted from a persisted blob. ``soak_ticks`` is left at its default here
+        and overlaid by the runner (it owns the soak counter)."""
+        return GovernorState(
+            version=STATE_VERSION,
+            ledgers={
+                issue_id: {
+                    "attempts": led.attempts,
+                    "consecutive_failures": led.consecutive_failures,
+                    "cost_spent": led.cost_spent,
+                    "tokens_spent": led.tokens_spent,
+                    "escalated": led.escalated,
+                    "done": led.done,
+                }
+                for issue_id, led in self._ledgers.items()
+            },
+            global_cost=self._global_cost,
+            global_tokens=self._global_tokens,
+            fleet_failures=self._fleet_failures,
+            halted=self._halted,
+            halt_reason=self._halt_reason,
+            circuit_open=self._circuit_open,
+            fleet_escalated=self._fleet_escalated,
+        )
+
+    def restore(self, state: GovernorState) -> None:
+        """Rehydrate the in-memory ledger from a persisted :class:`GovernorState`.
+
+        Replaces the per-issue ledgers and the fleet-wide counters/breakers so a
+        fresh Governor in a fresh process resumes exactly where the last tick left
+        off. The escalation *list* is not restored (escalations are emitted to the
+        human at the time they fire, not replayed); the per-issue ``escalated``
+        flag IS, so an already-escalated issue stays terminal across ticks."""
+        self._ledgers = {
+            issue_id: IssueLedger(
+                issue_id=issue_id,
+                attempts=int(d.get("attempts", 0)),
+                consecutive_failures=int(d.get("consecutive_failures", 0)),
+                cost_spent=float(d.get("cost_spent", 0.0)),
+                tokens_spent=int(d.get("tokens_spent", 0)),
+                escalated=bool(d.get("escalated", False)),
+                done=bool(d.get("done", False)),
+            )
+            for issue_id, d in state.ledgers.items()
+        }
+        self._global_cost = float(state.global_cost)
+        self._global_tokens = int(state.global_tokens)
+        self._fleet_failures = int(state.fleet_failures)
+        self._halted = bool(state.halted)
+        self._halt_reason = str(state.halt_reason)
+        self._circuit_open = bool(state.circuit_open)
+        self._fleet_escalated = bool(state.fleet_escalated)
 
     # -- per-issue ledger --------------------------------------------------- #
     def ledger(self, issue_id: str) -> IssueLedger:
